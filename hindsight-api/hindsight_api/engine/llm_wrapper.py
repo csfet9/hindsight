@@ -58,7 +58,7 @@ class LLMProvider:
         Initialize LLM provider.
 
         Args:
-            provider: Provider name ("openai", "groq", "ollama", "gemini").
+            provider: Provider name ("openai", "groq", "ollama", "gemini", "anthropic", "lmstudio").
             api_key: API key.
             base_url: Base URL for the API.
             model: Model name.
@@ -71,7 +71,7 @@ class LLMProvider:
         self.reasoning_effort = reasoning_effort
 
         # Validate provider
-        valid_providers = ["openai", "groq", "ollama", "gemini"]
+        valid_providers = ["openai", "groq", "ollama", "gemini", "anthropic", "lmstudio"]
         if self.provider not in valid_providers:
             raise ValueError(f"Invalid LLM provider: {self.provider}. Must be one of: {', '.join(valid_providers)}")
 
@@ -81,25 +81,38 @@ class LLMProvider:
                 self.base_url = "https://api.groq.com/openai/v1"
             elif self.provider == "ollama":
                 self.base_url = "http://localhost:11434/v1"
+            elif self.provider == "lmstudio":
+                self.base_url = "http://localhost:1234/v1"
 
-        # Validate API key (not needed for ollama)
-        if self.provider != "ollama" and not self.api_key:
+        # Validate API key (not needed for ollama or lmstudio)
+        if self.provider not in ("ollama", "lmstudio") and not self.api_key:
             raise ValueError(f"API key not found for {self.provider}")
 
         # Create client based on provider
+        self._client = None
+        self._gemini_client = None
+        self._anthropic_client = None
+
         if self.provider == "gemini":
             self._gemini_client = genai.Client(api_key=self.api_key)
-            self._client = None
-        elif self.provider == "ollama":
-            self._client = AsyncOpenAI(api_key="ollama", base_url=self.base_url, max_retries=0)
-            self._gemini_client = None
+        elif self.provider == "anthropic":
+            from anthropic import AsyncAnthropic
+
+            # Only pass base_url if it's set (Anthropic uses default URL otherwise)
+            anthropic_kwargs = {"api_key": self.api_key}
+            if self.base_url:
+                anthropic_kwargs["base_url"] = self.base_url
+            self._anthropic_client = AsyncAnthropic(**anthropic_kwargs)
+        elif self.provider in ("ollama", "lmstudio"):
+            # Use dummy key if not provided for local
+            api_key = self.api_key or "local"
+            self._client = AsyncOpenAI(api_key=api_key, base_url=self.base_url, max_retries=0)
         else:
             # Only pass base_url if it's set (OpenAI uses default URL otherwise)
             client_kwargs = {"api_key": self.api_key, "max_retries": 0}
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
-            self._client = AsyncOpenAI(**client_kwargs)  # type: ignore[invalid-argument-type] - dict kwargs
-            self._gemini_client = None
+            self._client = AsyncOpenAI(**client_kwargs)
 
     async def verify_connection(self) -> None:
         """
@@ -163,6 +176,12 @@ class LLMProvider:
             # Handle Gemini provider separately
             if self.provider == "gemini":
                 return await self._call_gemini(
+                    messages, response_format, max_retries, initial_backoff, max_backoff, skip_validation, start_time
+                )
+
+            # Handle Anthropic provider separately
+            if self.provider == "anthropic":
+                return await self._call_anthropic(
                     messages, response_format, max_retries, initial_backoff, max_backoff, skip_validation, start_time
                 )
 
@@ -238,35 +257,52 @@ class LLMProvider:
                                     schema_msg + "\n\n" + call_params["messages"][0]["content"]
                                 )
 
-                        call_params["response_format"] = {"type": "json_object"}
+                        # LM Studio and Ollama don't support json_object response format reliably
+                        # We rely on the schema in the system message instead
+                        if self.provider not in ("lmstudio", "ollama"):
+                            call_params["response_format"] = {"type": "json_object"}
+                        
                         response = await self._client.chat.completions.create(**call_params)
 
                         content = response.choices[0].message.content
 
-                        # Log raw LLM response for debugging JSON parse issues
-                        try:
-                            json_data = json.loads(content)
-                        except json.JSONDecodeError as json_err:
-                            # Truncate content for logging (first 500 and last 200 chars)
-                            content_preview = content[:500] if content else "<empty>"
-                            if content and len(content) > 700:
-                                content_preview = f"{content[:500]}...TRUNCATED...{content[-200:]}"
-                            logger.warning(
-                                f"JSON parse error from LLM response (attempt {attempt + 1}/{max_retries + 1}): {json_err}\n"
-                                f"  Model: {self.provider}/{self.model}\n"
-                                f"  Content length: {len(content) if content else 0} chars\n"
-                                f"  Content preview: {content_preview!r}\n"
-                                f"  Finish reason: {response.choices[0].finish_reason if response.choices else 'unknown'}"
-                            )
-                            # Retry on JSON parse errors - LLM may return valid JSON on next attempt
-                            if attempt < max_retries:
-                                backoff = min(initial_backoff * (2**attempt), max_backoff)
-                                await asyncio.sleep(backoff)
-                                last_exception = json_err
-                                continue
-                            else:
-                                logger.error(f"JSON parse error after {max_retries + 1} attempts, giving up")
-                                raise
+                        # For local models, they may wrap JSON in markdown code blocks
+                        if self.provider in ("lmstudio", "ollama"):
+                            clean_content = content
+                            if "```json" in content:
+                                clean_content = content.split("```json")[1].split("```")[0].strip()
+                            elif "```" in content:
+                                clean_content = content.split("```")[1].split("```")[0].strip()
+                            try:
+                                json_data = json.loads(clean_content)
+                            except json.JSONDecodeError:
+                                # Fallback to parsing raw content
+                                json_data = json.loads(content)
+                        else:
+                            # Log raw LLM response for debugging JSON parse issues
+                            try:
+                                json_data = json.loads(content)
+                            except json.JSONDecodeError as json_err:
+                                # Truncate content for logging (first 500 and last 200 chars)
+                                content_preview = content[:500] if content else "<empty>"
+                                if content and len(content) > 700:
+                                    content_preview = f"{content[:500]}...TRUNCATED...{content[-200:]}"
+                                logger.warning(
+                                    f"JSON parse error from LLM response (attempt {attempt + 1}/{max_retries + 1}): {json_err}\n"
+                                    f"  Model: {self.provider}/{self.model}\n"
+                                    f"  Content length: {len(content) if content else 0} chars\n"
+                                    f"  Content preview: {content_preview!r}\n"
+                                    f"  Finish reason: {response.choices[0].finish_reason if response.choices else 'unknown'}"
+                                )
+                                # Retry on JSON parse errors - LLM may return valid JSON on next attempt
+                                if attempt < max_retries:
+                                    backoff = min(initial_backoff * (2**attempt), max_backoff)
+                                    await asyncio.sleep(backoff)
+                                    last_exception = json_err
+                                    continue
+                                else:
+                                    logger.error(f"JSON parse error after {max_retries + 1} attempts, giving up")
+                                    raise
 
                         if skip_validation:
                             result = json_data
@@ -338,6 +374,142 @@ class LLMProvider:
             if last_exception:
                 raise last_exception
             raise RuntimeError("LLM call failed after all retries with no exception captured")
+
+    async def _call_anthropic(
+        self,
+        messages: list[dict[str, str]],
+        response_format: Any | None,
+        max_retries: int,
+        initial_backoff: float,
+        max_backoff: float,
+        skip_validation: bool,
+        start_time: float,
+    ) -> Any:
+        """Handle Anthropic-specific API calls."""
+        from anthropic import APIConnectionError, APIStatusError, RateLimitError
+
+        # Convert OpenAI-style messages to Anthropic format
+        system_prompt = None
+        anthropic_messages = []
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            if role == "system":
+                if system_prompt:
+                    system_prompt += "\n\n" + content
+                else:
+                    system_prompt = content
+            else:
+                anthropic_messages.append({"role": role, "content": content})
+
+        # Add JSON schema instruction if response_format is provided
+        if response_format is not None and hasattr(response_format, "model_json_schema"):
+            schema = response_format.model_json_schema()
+            schema_msg = f"\n\nYou must respond with valid JSON matching this schema:\n{json.dumps(schema, indent=2)}"
+            if system_prompt:
+                system_prompt += schema_msg
+            else:
+                system_prompt = schema_msg
+
+        # Prepare parameters
+        call_params = {
+            "model": self.model,
+            "messages": anthropic_messages,
+            "max_tokens": 4096,  # Default reasonable max tokens
+        }
+
+        if system_prompt:
+            call_params["system"] = system_prompt
+
+        last_exception = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                response = await self._anthropic_client.messages.create(**call_params)
+
+                # Anthropic response content is a list of blocks
+                content = ""
+                for block in response.content:
+                    if block.type == "text":
+                        content += block.text
+
+                if response_format is not None:
+                    # Find JSON in content (simple heuristic or just parse all)
+                    # Often models wrap JSON in ```json ... ```
+                    clean_content = content
+                    if "```json" in content:
+                        clean_content = content.split("```json")[1].split("```")[0].strip()
+                    elif "```" in content:
+                        clean_content = content.split("```")[1].strip()
+
+                    try:
+                        json_data = json.loads(clean_content)
+                    except json.JSONDecodeError:
+                        # Fallback to parsing raw content if markdown stripping failed
+                        json_data = json.loads(content)
+
+                    if skip_validation:
+                        result = json_data
+                    else:
+                        result = response_format.model_validate(json_data)
+                else:
+                    result = content
+
+                # Log slow calls
+                duration = time.time() - start_time
+                if duration > 10.0:
+                    input_tokens = response.usage.input_tokens
+                    output_tokens = response.usage.output_tokens
+                    logger.info(
+                        f"slow llm call: model={self.provider}/{self.model}, "
+                        f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
+                        f"time={duration:.3f}s"
+                    )
+
+                return result
+
+            except json.JSONDecodeError as e:
+                last_exception = e
+                if attempt < max_retries:
+                    logger.warning("Anthropic returned invalid JSON, retrying...")
+                    backoff = min(initial_backoff * (2**attempt), max_backoff)
+                    await asyncio.sleep(backoff)
+                    continue
+                else:
+                    logger.error(f"Anthropic returned invalid JSON after {max_retries + 1} attempts")
+                    raise
+
+            except (APIConnectionError, RateLimitError, APIStatusError) as e:
+                # Fast fail on 401/403
+                if isinstance(e, APIStatusError) and e.status_code in (401, 403):
+                    logger.error(f"Anthropic auth error (HTTP {e.status_code}), not retrying: {str(e)}")
+                    raise
+
+                last_exception = e
+                if attempt < max_retries:
+                    # Check if it's a rate limit or server error
+                    should_retry = isinstance(e, (APIConnectionError, RateLimitError)) or (
+                        isinstance(e, APIStatusError) and e.status_code >= 500
+                    )
+
+                    if should_retry:
+                        backoff = min(initial_backoff * (2**attempt), max_backoff)
+                        jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
+                        await asyncio.sleep(backoff + jitter)
+                        continue
+
+                logger.error(f"Anthropic API error after {max_retries + 1} attempts: {str(e)}")
+                raise
+
+            except Exception as e:
+                logger.error(f"Unexpected error during Anthropic call: {type(e).__name__}: {str(e)}")
+                raise
+
+        if last_exception:
+            raise last_exception
+        raise RuntimeError("Anthropic call failed after all retries")
 
     async def _call_ollama_native(
         self,

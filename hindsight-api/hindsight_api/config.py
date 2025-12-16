@@ -156,6 +156,8 @@ class HindsightConfig:
             return "https://api.groq.com/openai/v1"
         elif provider == "ollama":
             return "http://localhost:11434/v1"
+        elif provider == "lmstudio":
+            return "http://localhost:1234/v1"
         else:
             return ""
 
