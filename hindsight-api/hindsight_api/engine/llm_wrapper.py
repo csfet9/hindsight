@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -166,7 +167,7 @@ class LLMProvider:
         response_format: Any | None = None,
         max_completion_tokens: int | None = None,
         temperature: float | None = None,
-        scope: str = "memory",
+        scope: str = "memory",  # Reserved for future metrics/tracing
         max_retries: int = 10,
         initial_backoff: float = 1.0,
         max_backoff: float = 60.0,
@@ -180,7 +181,7 @@ class LLMProvider:
             response_format: Optional Pydantic model for structured output.
             max_completion_tokens: Maximum tokens in response.
             temperature: Sampling temperature (0.0-2.0).
-            scope: Scope identifier for tracking.
+            scope: Scope identifier for tracking (reserved for future metrics).
             max_retries: Maximum retry attempts.
             initial_backoff: Initial backoff time in seconds.
             max_backoff: Maximum backoff time in seconds.
@@ -195,6 +196,7 @@ class LLMProvider:
         """
         async with _global_llm_semaphore:
             start_time = time.time()
+            _ = scope  # Suppress unused warning; reserved for future metrics
 
             # Handle Gemini provider separately
             if self.provider == "gemini":
@@ -227,9 +229,10 @@ class LLMProvider:
                 "messages": messages,
             }
 
-            # Check if model supports reasoning parameter (o1, o3, gpt-5 families)
+            # Check if model supports reasoning parameter (o1, o3, gpt-5, deepseek, qwq families)
+            # Note: Local reasoning models (qwen, deepseek) output <think> tags which are stripped above
             model_lower = self.model.lower()
-            is_reasoning_model = any(x in model_lower for x in ["gpt-5", "o1", "o3", "deepseek"])
+            is_reasoning_model = any(x in model_lower for x in ["gpt-5", "o1", "o3", "deepseek", "qwq"])
 
             # For GPT-4 and GPT-4.1 models, cap max_completion_tokens to 32000
             # For GPT-4o models, cap to 16384
@@ -290,6 +293,18 @@ class LLMProvider:
                         logger.debug(f"Received response from {self.provider}/{self.model}")
 
                         content = response.choices[0].message.content
+
+                        # Strip reasoning model thinking tags (various formats)
+                        # Supports: <think>, <thinking>, <reasoning>, |startthink|/|endthink|
+                        if content:
+                            original_len = len(content)
+                            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+                            content = re.sub(r"<thinking>.*?</thinking>", "", content, flags=re.DOTALL)
+                            content = re.sub(r"<reasoning>.*?</reasoning>", "", content, flags=re.DOTALL)
+                            content = re.sub(r"\|startthink\|.*?\|endthink\|", "", content, flags=re.DOTALL)
+                            content = content.strip()
+                            if len(content) < original_len:
+                                logger.debug(f"Stripped {original_len - len(content)} chars of reasoning tokens")
 
                         # For local models, they may wrap JSON in markdown code blocks
                         if self.provider in ("lmstudio", "ollama"):
@@ -623,9 +638,22 @@ class LLMProvider:
 
                     # Validate against Pydantic model or return raw JSON
                     if skip_validation:
-                        return json_data
+                        validated_result = json_data
                     else:
-                        return response_format.model_validate(json_data)
+                        validated_result = response_format.model_validate(json_data)
+
+                    # Log slow calls
+                    duration = time.time() - start_time
+                    if duration > 10.0:
+                        eval_count = result.get("eval_count", 0)
+                        prompt_eval_count = result.get("prompt_eval_count", 0)
+                        logger.info(
+                            f"slow llm call: model=ollama/{self.model}, "
+                            f"input_tokens={prompt_eval_count}, output_tokens={eval_count}, "
+                            f"time={duration:.3f}s"
+                        )
+
+                    return validated_result
 
                 except httpx.HTTPStatusError as e:
                     last_exception = e
