@@ -2,14 +2,25 @@
 # Retry wrapper - waits for dependencies before starting hindsight
 
 LLM_BASE_URL="${HINDSIGHT_API_LLM_BASE_URL:-http://host.docker.internal:1234/v1}"
-DB_HOST="${HINDSIGHT_API_DATABASE_URL:-postgresql://hindsight:hindsight@hindsight-db:5432/hindsight}"
 MAX_RETRIES="${HINDSIGHT_RETRY_MAX:-0}"  # 0 = infinite
 RETRY_INTERVAL="${HINDSIGHT_RETRY_INTERVAL:-10}"
 
-# Extract DB host from URL for checking
-DB_CHECK_HOST=$(echo "$DB_HOST" | sed -E 's|.*@([^:/]+):([0-9]+)/.*|\1 \2|')
+# Check if external database is configured (skip check for embedded pg0)
+# If HINDSIGHT_API_DATABASE_URL is not set, we use embedded pg0 which starts with start-all.sh
+SKIP_DB_CHECK=false
+if [ -z "${HINDSIGHT_API_DATABASE_URL}" ]; then
+    SKIP_DB_CHECK=true
+    echo "No external database configured - using embedded pg0"
+else
+    DB_HOST="${HINDSIGHT_API_DATABASE_URL}"
+    # Extract DB host from URL for checking
+    DB_CHECK_HOST=$(echo "$DB_HOST" | sed -E 's|.*@([^:/]+):([0-9]+)/.*|\1 \2|')
+fi
 
 check_db() {
+    if $SKIP_DB_CHECK; then
+        return 0  # Skip check, always pass
+    fi
     if command -v pg_isready &> /dev/null; then
         pg_isready -h $(echo $DB_CHECK_HOST | cut -d' ' -f1) -p $(echo $DB_CHECK_HOST | cut -d' ' -f2) &>/dev/null
     else
@@ -32,7 +43,11 @@ while true; do
     llm_ok=false
 
     if check_db; then
-        echo "  [OK] Database accessible"
+        if $SKIP_DB_CHECK; then
+            echo "  [OK] Database (embedded pg0 - starts with app)"
+        else
+            echo "  [OK] Database accessible"
+        fi
         db_ok=true
     else
         echo "  [..] Database not accessible"
