@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -304,6 +305,18 @@ class LLMProvider:
                         logger.debug(f"Received response from {self.provider}/{self.model}")
 
                         content = response.choices[0].message.content
+
+                        # Strip reasoning model thinking tags (various formats)
+                        # Supports: <think>, <thinking>, <reasoning>, |startthink|/|endthink|
+                        if content:
+                            original_len = len(content)
+                            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+                            content = re.sub(r"<thinking>.*?</thinking>", "", content, flags=re.DOTALL)
+                            content = re.sub(r"<reasoning>.*?</reasoning>", "", content, flags=re.DOTALL)
+                            content = re.sub(r"\|startthink\|.*?\|endthink\|", "", content, flags=re.DOTALL)
+                            content = content.strip()
+                            if len(content) < original_len:
+                                logger.debug(f"Stripped {original_len - len(content)} chars of reasoning tokens")
 
                         # For local models, they may wrap JSON in markdown code blocks
                         if self.provider in ("lmstudio", "ollama"):
