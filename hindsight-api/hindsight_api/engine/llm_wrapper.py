@@ -20,6 +20,7 @@ from ..config import (
     DEFAULT_LLM_MAX_CONCURRENT,
     DEFAULT_LLM_TIMEOUT,
     ENV_LLM_MAX_CONCURRENT,
+    ENV_LLM_STRIP_THINKING,
     ENV_LLM_TIMEOUT,
 )
 
@@ -299,16 +300,18 @@ class LLMProvider:
                                     )
                             if self.provider not in ("lmstudio", "ollama"):
                                call_params["response_format"] = {"type": "json_object"}
-                        
+
                         logger.debug(f"Sending request to {self.provider}/{self.model} (timeout={self.timeout})")
                         response = await self._client.chat.completions.create(**call_params)
                         logger.debug(f"Received response from {self.provider}/{self.model}")
 
                         content = response.choices[0].message.content
 
-                        # Strip reasoning model thinking tags (various formats)
+                        # Strip reasoning model thinking tags when enabled (opt-in for local LLMs)
                         # Supports: <think>, <thinking>, <reasoning>, |startthink|/|endthink|
-                        if content:
+                        # Enable with HINDSIGHT_API_LLM_STRIP_THINKING=true for reasoning models
+                        # that embed thinking in their output (e.g., Qwen3, DeepSeek on LM Studio)
+                        if content and os.getenv(ENV_LLM_STRIP_THINKING, "false").lower() == "true":
                             original_len = len(content)
                             content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
                             content = re.sub(r"<thinking>.*?</thinking>", "", content, flags=re.DOTALL)
