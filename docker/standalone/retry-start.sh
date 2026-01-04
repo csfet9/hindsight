@@ -2,8 +2,20 @@
 # Retry wrapper - waits for dependencies before starting hindsight
 
 LLM_BASE_URL="${HINDSIGHT_API_LLM_BASE_URL:-http://host.docker.internal:1234/v1}"
+LLM_PROVIDER="${HINDSIGHT_API_LLM_PROVIDER:-lmstudio}"
 MAX_RETRIES="${HINDSIGHT_RETRY_MAX:-0}"  # 0 = infinite
 RETRY_INTERVAL="${HINDSIGHT_RETRY_INTERVAL:-10}"
+
+# Cloud providers don't need local endpoint check
+CLOUD_PROVIDERS="openai anthropic gemini groq"
+SKIP_LLM_CHECK=false
+for provider in $CLOUD_PROVIDERS; do
+    if [ "$LLM_PROVIDER" = "$provider" ]; then
+        SKIP_LLM_CHECK=true
+        echo "Cloud LLM provider detected ($LLM_PROVIDER) - skipping endpoint check"
+        break
+    fi
+done
 
 # Check if external database is configured (skip check for embedded pg0)
 # If HINDSIGHT_API_DATABASE_URL is not set, we use embedded pg0 which starts with start-all.sh
@@ -30,6 +42,9 @@ check_db() {
 }
 
 check_llm() {
+    if $SKIP_LLM_CHECK; then
+        return 0  # Skip check for cloud providers
+    fi
     curl -sf "${LLM_BASE_URL}/models" --connect-timeout 5 &>/dev/null
 }
 
@@ -54,7 +69,11 @@ while true; do
     fi
 
     if check_llm; then
-        echo "  [OK] LLM Studio accessible"
+        if $SKIP_LLM_CHECK; then
+            echo "  [OK] LLM ($LLM_PROVIDER - cloud API)"
+        else
+            echo "  [OK] LLM Studio accessible"
+        fi
         llm_ok=true
     else
         echo "  [..] LLM Studio not accessible (${LLM_BASE_URL})"
