@@ -570,7 +570,7 @@ Text:
                 response_format=FactExtractionResponse,
                 scope="memory_extract_facts",
                 temperature=0.1,
-                max_completion_tokens=65000,
+                max_completion_tokens=8192,
                 skip_validation=True,  # Get raw JSON, we'll validate leniently
             )
 
