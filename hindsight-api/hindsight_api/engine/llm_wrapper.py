@@ -19,8 +19,10 @@ from openai import APIConnectionError, APIStatusError, AsyncOpenAI, LengthFinish
 from ..config import (
     DEFAULT_LLM_MAX_CONCURRENT,
     DEFAULT_LLM_TIMEOUT,
+    DEFAULT_LLM_THINKING_LEVEL,
     ENV_LLM_MAX_CONCURRENT,
     ENV_LLM_TIMEOUT,
+    ENV_LLM_THINKING_LEVEL,
 )
 
 # Seed applied to every Groq request for deterministic behavior.
@@ -203,7 +205,8 @@ class LLMProvider:
             # Handle Gemini provider separately
             if self.provider == "gemini":
                 return await self._call_gemini(
-                    messages, response_format, max_retries, initial_backoff, max_backoff, skip_validation, start_time
+                    messages, response_format, max_retries, initial_backoff, max_backoff, skip_validation, start_time,
+                    max_completion_tokens=max_completion_tokens, temperature=temperature
                 )
 
             # Handle Anthropic provider separately
@@ -713,8 +716,10 @@ class LLMProvider:
         max_backoff: float,
         skip_validation: bool,
         start_time: float,
+        max_completion_tokens: int | None = None,
+        temperature: float | None = None,
     ) -> Any:
-        """Handle Gemini-specific API calls."""
+        """Handle Gemini-specific API calls with Gemini 3 optimizations."""
         # Convert OpenAI-style messages to Gemini format
         system_instruction = None
         gemini_contents = []
@@ -749,6 +754,32 @@ class LLMProvider:
         if response_format is not None:
             config_kwargs["response_mime_type"] = "application/json"
             config_kwargs["response_schema"] = response_format
+
+        # Add temperature if provided
+        if temperature is not None:
+            config_kwargs["temperature"] = temperature
+
+        # Add max output tokens if provided
+        if max_completion_tokens is not None:
+            config_kwargs["max_output_tokens"] = max_completion_tokens
+
+        # Check if using Gemini 3 model and add thinking config
+        # Gemini 3 models support thinking_level: LOW, MEDIUM (flash only), HIGH
+        model_lower = self.model.lower()
+        is_gemini_3 = "gemini-3" in model_lower or "gemini3" in model_lower
+        if is_gemini_3:
+            # Get thinking level from env var (default: low for fast processing)
+            thinking_level_env = os.getenv(ENV_LLM_THINKING_LEVEL, DEFAULT_LLM_THINKING_LEVEL).lower()
+            thinking_level_map = {
+                "low": "LOW",
+                "medium": "MEDIUM",
+                "high": "HIGH",
+            }
+            thinking_level = thinking_level_map.get(thinking_level_env, "LOW")
+            config_kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                thinking_level=thinking_level
+            )
+            logger.debug(f"Gemini 3 thinking_level: {thinking_level}")
 
         generation_config = genai_types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
@@ -822,7 +853,13 @@ class LLMProvider:
                 if e.code in (400, 429, 500, 502, 503, 504) or (e.code and e.code >= 500):
                     last_exception = e
                     if attempt < max_retries:
-                        backoff = min(initial_backoff * (2**attempt), max_backoff)
+                        # Use longer backoff for rate limits (429) - free tier has 15 RPM
+                        if e.code == 429:
+                            # For rate limits, use minimum 10s backoff, max 120s
+                            backoff = min(max(10.0, initial_backoff * (2**attempt)), 120.0)
+                            logger.warning(f"Gemini rate limit hit (429), backing off {backoff:.1f}s (attempt {attempt + 1}/{max_retries + 1})")
+                        else:
+                            backoff = min(initial_backoff * (2**attempt), max_backoff)
                         jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
                         await asyncio.sleep(backoff + jitter)
                     else:
@@ -830,6 +867,25 @@ class LLMProvider:
                         raise
                 else:
                     logger.error(f"Gemini API error: {type(e).__name__}: {str(e)}")
+                    raise
+
+            except genai_errors.ClientError as e:
+                # Handle ClientError (includes 429 rate limit)
+                error_code = getattr(e, 'code', None) or 429  # Default to 429 for rate limits
+                if error_code == 429 or "RESOURCE_EXHAUSTED" in str(e):
+                    last_exception = e
+                    if attempt < max_retries:
+                        # Use longer backoff for rate limits - free tier has 15 RPM
+                        backoff = min(max(10.0, initial_backoff * (2**attempt)), 120.0)
+                        logger.warning(f"Gemini rate limit hit, backing off {backoff:.1f}s (attempt {attempt + 1}/{max_retries + 1})")
+                        jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
+                        await asyncio.sleep(backoff + jitter)
+                        continue
+                    else:
+                        logger.error(f"Gemini rate limit error after {max_retries + 1} attempts: {str(e)}")
+                        raise
+                else:
+                    logger.error(f"Gemini client error: {type(e).__name__}: {str(e)}")
                     raise
 
             except Exception as e:
