@@ -19,6 +19,7 @@ result = client.signal(
         {
             "fact_id": "abc-123-def-456",
             "signal_type": "used",
+            "query": "How do I implement authentication?",
             "confidence": 1.0
         }
     ]
@@ -27,13 +28,14 @@ print(f"Processed: {result.signals_processed}")
 # endregion submit-signal
 
 # region submit-batch
-# Submit multiple signals at once
+# Submit multiple signals at once (same query context)
+query = "database connection pooling best practices"
 result = client.signal(
     signals=[
-        {"fact_id": "fact-1", "signal_type": "used", "confidence": 1.0},
-        {"fact_id": "fact-2", "signal_type": "ignored", "confidence": 0.8},
-        {"fact_id": "fact-3", "signal_type": "helpful", "confidence": 0.95},
-        {"fact_id": "fact-4", "signal_type": "not_helpful", "confidence": 0.7},
+        {"fact_id": "fact-1", "signal_type": "used", "query": query, "confidence": 1.0},
+        {"fact_id": "fact-2", "signal_type": "ignored", "query": query, "confidence": 0.8},
+        {"fact_id": "fact-3", "signal_type": "helpful", "query": query, "confidence": 0.95},
+        {"fact_id": "fact-4", "signal_type": "not_helpful", "query": query, "confidence": 0.7},
     ]
 )
 print(f"Updated facts: {result.updated_facts}")
@@ -104,22 +106,24 @@ results = client.recall(
 # region feedback-loop
 # Complete feedback loop example
 # 1. Recall memories
-recalled = client.recall(query="database connection pooling")
+query = "database connection pooling"
+recalled = client.recall(query=query)
 fact_ids = [r.id for r in recalled]
 
 # 2. Agent uses some facts in its response
 used_facts = ["fact-1", "fact-3"]  # Facts actually referenced
 ignored_facts = [f for f in fact_ids if f not in used_facts]
 
-# 3. Submit feedback
+# 3. Submit feedback with the same query context
+# This ties feedback to the specific query, enabling context-aware scoring
 signals = [
-    {"fact_id": fid, "signal_type": "used", "confidence": 1.0}
+    {"fact_id": fid, "signal_type": "used", "query": query, "confidence": 1.0}
     for fid in used_facts
 ] + [
-    {"fact_id": fid, "signal_type": "ignored", "confidence": 0.5}
+    {"fact_id": fid, "signal_type": "ignored", "query": query, "confidence": 0.5}
     for fid in ignored_facts
 ]
 
 client.signal(signals=signals)
-# Future recalls will boost facts that are frequently used
+# Future recalls with similar queries will boost facts that performed well
 # endregion feedback-loop

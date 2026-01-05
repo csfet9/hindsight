@@ -17,6 +17,7 @@ const result = await client.signal({
     {
       fact_id: "abc-123-def-456",
       signal_type: "used",
+      query: "How do I implement authentication?",
       confidence: 1.0
     }
   ]
@@ -25,13 +26,14 @@ console.log(`Processed: ${result.signals_processed}`);
 // endregion submit-signal
 
 // region submit-batch
-// Submit multiple signals at once
+// Submit multiple signals at once (same query context)
+const query = "database connection pooling best practices";
 const batchResult = await client.signal({
   signals: [
-    { fact_id: "fact-1", signal_type: "used", confidence: 1.0 },
-    { fact_id: "fact-2", signal_type: "ignored", confidence: 0.8 },
-    { fact_id: "fact-3", signal_type: "helpful", confidence: 0.95 },
-    { fact_id: "fact-4", signal_type: "not_helpful", confidence: 0.7 },
+    { fact_id: "fact-1", signal_type: "used", query, confidence: 1.0 },
+    { fact_id: "fact-2", signal_type: "ignored", query, confidence: 0.8 },
+    { fact_id: "fact-3", signal_type: "helpful", query, confidence: 0.95 },
+    { fact_id: "fact-4", signal_type: "not_helpful", query, confidence: 0.7 },
   ]
 });
 console.log(`Updated facts: ${batchResult.updated_facts}`);
@@ -104,19 +106,21 @@ const filtered = await client.recall({
 // region feedback-loop
 // Complete feedback loop example
 // 1. Recall memories
-const recalled = await client.recall({ query: "database connection pooling" });
+const recallQuery = "database connection pooling";
+const recalled = await client.recall({ query: recallQuery });
 const factIds = recalled.map(r => r.id);
 
 // 2. Agent uses some facts in its response
 const usedFacts = ["fact-1", "fact-3"];  // Facts actually referenced
 const ignoredFacts = factIds.filter(f => !usedFacts.includes(f));
 
-// 3. Submit feedback
-const signals = [
-  ...usedFacts.map(fid => ({ fact_id: fid, signal_type: "used", confidence: 1.0 })),
-  ...ignoredFacts.map(fid => ({ fact_id: fid, signal_type: "ignored", confidence: 0.5 }))
+// 3. Submit feedback with the same query context
+// This ties feedback to the specific query, enabling context-aware scoring
+const feedbackSignals = [
+  ...usedFacts.map(fid => ({ fact_id: fid, signal_type: "used", query: recallQuery, confidence: 1.0 })),
+  ...ignoredFacts.map(fid => ({ fact_id: fid, signal_type: "ignored", query: recallQuery, confidence: 0.5 }))
 ];
 
-await client.signal({ signals });
-// Future recalls will boost facts that are frequently used
+await client.signal({ signals: feedbackSignals });
+// Future recalls with similar queries will boost facts that performed well
 // endregion feedback-loop

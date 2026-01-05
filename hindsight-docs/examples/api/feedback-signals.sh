@@ -14,6 +14,7 @@ curl -X POST "$HINDSIGHT_URL/v1/default/banks/$BANK_ID/signal" \
       {
         "fact_id": "abc-123-def-456",
         "signal_type": "used",
+        "query": "How do I implement authentication?",
         "confidence": 1.0
       }
     ]
@@ -21,21 +22,21 @@ curl -X POST "$HINDSIGHT_URL/v1/default/banks/$BANK_ID/signal" \
 # endregion submit-signal
 
 # region submit-batch
-# Submit multiple signals at once
+# Submit multiple signals at once (same query context)
 curl -X POST "$HINDSIGHT_URL/v1/default/banks/$BANK_ID/signal" \
   -H "Content-Type: application/json" \
   -d '{
     "signals": [
-      {"fact_id": "fact-1", "signal_type": "used", "confidence": 1.0},
-      {"fact_id": "fact-2", "signal_type": "ignored", "confidence": 0.8},
-      {"fact_id": "fact-3", "signal_type": "helpful", "confidence": 0.95},
-      {"fact_id": "fact-4", "signal_type": "not_helpful", "confidence": 0.7}
+      {"fact_id": "fact-1", "signal_type": "used", "query": "database pooling", "confidence": 1.0},
+      {"fact_id": "fact-2", "signal_type": "ignored", "query": "database pooling", "confidence": 0.8},
+      {"fact_id": "fact-3", "signal_type": "helpful", "query": "database pooling", "confidence": 0.95},
+      {"fact_id": "fact-4", "signal_type": "not_helpful", "query": "database pooling", "confidence": 0.7}
     ]
   }'
 # endregion submit-batch
 
 # region signal-with-context
-# Submit signal with query context for pattern tracking
+# Submit signal with additional context description
 curl -X POST "$HINDSIGHT_URL/v1/default/banks/$BANK_ID/signal" \
   -H "Content-Type: application/json" \
   -d '{
@@ -45,7 +46,7 @@ curl -X POST "$HINDSIGHT_URL/v1/default/banks/$BANK_ID/signal" \
         "signal_type": "helpful",
         "confidence": 0.9,
         "query": "authentication patterns",
-        "context": "User found this answer helpful"
+        "context": "User found this answer helpful for implementing OAuth"
       }
     ]
   }'

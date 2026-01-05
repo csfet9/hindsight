@@ -61,7 +61,13 @@ class SignalType(str, Enum):
 
 
 class SignalItem(BaseModel):
-    """A single feedback signal for a fact."""
+    """A single feedback signal for a fact.
+
+    The query field is required to enable query-context aware scoring.
+    This ensures feedback is tied to specific query contexts, so a fact
+    marked "helpful" for one query won't be incorrectly boosted for
+    unrelated queries.
+    """
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -78,7 +84,10 @@ class SignalItem(BaseModel):
     fact_id: str = Field(description="UUID of the fact to signal")
     signal_type: SignalType = Field(description="Type of signal")
     confidence: float = Field(default=1.0, ge=0.0, le=1.0, description="Confidence in the signal (0.0-1.0)")
-    query: str | None = Field(default=None, description="The query associated with this signal (for pattern tracking)")
+    query: str = Field(
+        min_length=1,
+        description="The query that triggered this recall (required for query-context aware scoring)"
+    )
     context: str | None = Field(default=None, description="Optional context about the signal")
 
 
@@ -89,8 +98,18 @@ class SignalRequest(BaseModel):
         json_schema_extra={
             "example": {
                 "signals": [
-                    {"fact_id": "123e4567-e89b-12d3-a456-426614174000", "signal_type": "used", "confidence": 1.0},
-                    {"fact_id": "456e7890-e12b-34d5-a678-901234567890", "signal_type": "ignored", "confidence": 0.8},
+                    {
+                        "fact_id": "123e4567-e89b-12d3-a456-426614174000",
+                        "signal_type": "used",
+                        "confidence": 1.0,
+                        "query": "What did Alice say about machine learning?",
+                    },
+                    {
+                        "fact_id": "456e7890-e12b-34d5-a678-901234567890",
+                        "signal_type": "ignored",
+                        "confidence": 0.8,
+                        "query": "What did Alice say about machine learning?",
+                    },
                 ]
             }
         }
