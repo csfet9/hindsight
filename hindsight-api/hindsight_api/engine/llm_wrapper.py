@@ -19,10 +19,8 @@ from openai import APIConnectionError, APIStatusError, AsyncOpenAI, LengthFinish
 from ..config import (
     DEFAULT_LLM_MAX_CONCURRENT,
     DEFAULT_LLM_TIMEOUT,
-    DEFAULT_LLM_THINKING_LEVEL,
     ENV_LLM_MAX_CONCURRENT,
     ENV_LLM_TIMEOUT,
-    ENV_LLM_THINKING_LEVEL,
 )
 
 # Seed applied to every Groq request for deterministic behavior.
@@ -773,18 +771,17 @@ class LLMProvider:
         model_lower = self.model.lower()
         is_gemini_3 = "gemini-3" in model_lower or "gemini3" in model_lower
         if is_gemini_3:
-            # Get thinking level from env var (default: low for fast processing)
-            thinking_level_env = os.getenv(ENV_LLM_THINKING_LEVEL, DEFAULT_LLM_THINKING_LEVEL).lower()
+            # Map reasoning_effort to Gemini thinking_level
             thinking_level_map = {
                 "low": "LOW",
                 "medium": "MEDIUM",
                 "high": "HIGH",
             }
-            thinking_level = thinking_level_map.get(thinking_level_env, "LOW")
+            thinking_level = thinking_level_map.get(self.reasoning_effort.lower(), "LOW")
             config_kwargs["thinking_config"] = genai_types.ThinkingConfig(
                 thinking_level=thinking_level
             )
-            logger.debug(f"Gemini 3 thinking_level: {thinking_level}")
+            logger.debug(f"Gemini 3 thinking_level: {thinking_level} (from reasoning_effort: {self.reasoning_effort})")
 
         generation_config = genai_types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
