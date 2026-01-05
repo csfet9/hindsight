@@ -123,11 +123,7 @@ class LLMProvider:
         elif self.provider in ("ollama", "lmstudio"):
             # Use dummy key if not provided for local
             api_key = self.api_key or "local"
-            client_kwargs = {
-                "api_key": api_key,
-                "base_url": self.base_url,
-                "max_retries": 0
-            }
+            client_kwargs = {"api_key": api_key, "base_url": self.base_url, "max_retries": 0}
             if self.timeout:
                 client_kwargs["timeout"] = self.timeout
             self._client = AsyncOpenAI(**client_kwargs)
@@ -212,7 +208,14 @@ class LLMProvider:
             # Handle Anthropic provider separately
             if self.provider == "anthropic":
                 return await self._call_anthropic(
-                    messages, response_format, max_completion_tokens, max_retries, initial_backoff, max_backoff, skip_validation, start_time
+                    messages,
+                    response_format,
+                    max_completion_tokens,
+                    max_retries,
+                    initial_backoff,
+                    max_backoff,
+                    skip_validation,
+                    start_time,
                 )
 
             # Handle Ollama with native API for structured output (better schema enforcement)
@@ -305,16 +308,19 @@ class LLMProvider:
                             # LM Studio and Ollama don't support json_object response format reliably
                             # We rely on the schema in the system message instead
                             if self.provider not in ("lmstudio", "ollama"):
-                               call_params["response_format"] = {"type": "json_object"}
-                        
+                                # LM Studio and Ollama don't support json_object response format reliably
+                                # We rely on the schema in the system message instead
+                                call_params["response_format"] = {"type": "json_object"}
+
                         logger.debug(f"Sending request to {self.provider}/{self.model} (timeout={self.timeout})")
                         response = await self._client.chat.completions.create(**call_params)
                         logger.debug(f"Received response from {self.provider}/{self.model}")
 
                         content = response.choices[0].message.content
 
-                        # Strip reasoning model thinking tags (various formats)
+                        # Strip reasoning model thinking tags
                         # Supports: <think>, <thinking>, <reasoning>, |startthink|/|endthink|
+                        # for reasoning models that embed thinking in their output (e.g., Qwen3, DeepSeek)
                         if content:
                             original_len = len(content)
                             content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
@@ -341,6 +347,7 @@ class LLMProvider:
                                     f"LLM returned empty response after {max_retries + 1} attempts "
                                     f"(finish_reason={finish_reason})"
                                 )
+
 
                         # For local models, they may wrap JSON in markdown code blocks
                         if self.provider in ("lmstudio", "ollama"):
