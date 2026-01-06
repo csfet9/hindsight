@@ -932,8 +932,9 @@ class LLMProvider:
             raise ValueError("HINDSIGHT_API_LLM_API_KEY environment variable is required")
         base_url = os.getenv("HINDSIGHT_API_LLM_BASE_URL", "")
         model = os.getenv("HINDSIGHT_API_LLM_MODEL", "openai/gpt-oss-120b")
+        reasoning_effort = os.getenv("HINDSIGHT_API_LLM_THINKING_LEVEL", "low")
 
-        return cls(provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort="low")
+        return cls(provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort=reasoning_effort)
 
     @classmethod
     def for_answer_generation(cls) -> "LLMProvider":
@@ -946,8 +947,9 @@ class LLMProvider:
             )
         base_url = os.getenv("HINDSIGHT_API_ANSWER_LLM_BASE_URL", os.getenv("HINDSIGHT_API_LLM_BASE_URL", ""))
         model = os.getenv("HINDSIGHT_API_ANSWER_LLM_MODEL", os.getenv("HINDSIGHT_API_LLM_MODEL", "openai/gpt-oss-120b"))
+        reasoning_effort = os.getenv("HINDSIGHT_API_LLM_THINKING_LEVEL", "high")
 
-        return cls(provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort="high")
+        return cls(provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort=reasoning_effort)
 
     @classmethod
     def for_judge(cls) -> "LLMProvider":
@@ -960,8 +962,9 @@ class LLMProvider:
             )
         base_url = os.getenv("HINDSIGHT_API_JUDGE_LLM_BASE_URL", os.getenv("HINDSIGHT_API_LLM_BASE_URL", ""))
         model = os.getenv("HINDSIGHT_API_JUDGE_LLM_MODEL", os.getenv("HINDSIGHT_API_LLM_MODEL", "openai/gpt-oss-120b"))
+        reasoning_effort = os.getenv("HINDSIGHT_API_LLM_THINKING_LEVEL", "high")
 
-        return cls(provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort="high")
+        return cls(provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort=reasoning_effort)
 
 
 # Backwards compatibility alias
