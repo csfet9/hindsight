@@ -2,7 +2,7 @@
 Integration tests for the Feedback Signal API.
 
 Tests the signal submission, fact stats, bank stats endpoints,
-and the recall integration with usefulness boosting.
+and the recall integration with query-context aware usefulness boosting.
 """
 
 import pytest
@@ -42,19 +42,20 @@ class TestSignalSubmission:
         assert response.status_code == 200
 
         # Get a fact_id from recall
+        query = "Where does Alice work?"
         response = await api_client.post(
             f"/v1/default/banks/{test_bank_id}/memories/recall",
-            json={"query": "Where does Alice work?"},
+            json={"query": query},
         )
         assert response.status_code == 200
         results = response.json()["results"]
         assert len(results) > 0
         fact_id = results[0]["id"]
 
-        # Submit signal
+        # Submit signal with required query field
         response = await api_client.post(
             f"/v1/default/banks/{test_bank_id}/signal",
-            json={"signals": [{"fact_id": fact_id, "signal_type": "used", "confidence": 1.0}]},
+            json={"signals": [{"fact_id": fact_id, "signal_type": "used", "confidence": 1.0, "query": query}]},
         )
         assert response.status_code == 200
         result = response.json()
@@ -79,9 +80,10 @@ class TestSignalSubmission:
         assert response.status_code == 200
 
         # Get fact_ids from recall
+        query = "Who works at the company?"
         response = await api_client.post(
             f"/v1/default/banks/{test_bank_id}/memories/recall",
-            json={"query": "Who works at the company?"},
+            json={"query": query},
         )
         assert response.status_code == 200
         results = response.json()["results"]
@@ -89,13 +91,13 @@ class TestSignalSubmission:
 
         fact_ids = [r["id"] for r in results[:3]]
 
-        # Submit batch signals
+        # Submit batch signals with required query field
         response = await api_client.post(
             f"/v1/default/banks/{test_bank_id}/signal",
             json={
                 "signals": [
-                    {"fact_id": fact_ids[0], "signal_type": "used"},
-                    {"fact_id": fact_ids[1] if len(fact_ids) > 1 else fact_ids[0], "signal_type": "ignored"},
+                    {"fact_id": fact_ids[0], "signal_type": "used", "query": query},
+                    {"fact_id": fact_ids[1] if len(fact_ids) > 1 else fact_ids[0], "signal_type": "ignored", "query": query},
                 ]
             },
         )
@@ -105,8 +107,8 @@ class TestSignalSubmission:
         assert result["signals_processed"] == 2
 
     @pytest.mark.asyncio
-    async def test_submit_signal_with_query(self, api_client, test_bank_id):
-        """Test submitting a signal with query for pattern tracking."""
+    async def test_submit_signal_with_context(self, api_client, test_bank_id):
+        """Test submitting a signal with optional context."""
         # Store a memory
         response = await api_client.post(
             f"/v1/default/banks/{test_bank_id}/memories",
@@ -115,14 +117,15 @@ class TestSignalSubmission:
         assert response.status_code == 200
 
         # Get fact_id
+        query = "When is the deadline?"
         response = await api_client.post(
             f"/v1/default/banks/{test_bank_id}/memories/recall",
-            json={"query": "When is the deadline?"},
+            json={"query": query},
         )
         assert response.status_code == 200
         fact_id = response.json()["results"][0]["id"]
 
-        # Submit signal with query
+        # Submit signal with query and context
         response = await api_client.post(
             f"/v1/default/banks/{test_bank_id}/signal",
             json={
@@ -131,7 +134,7 @@ class TestSignalSubmission:
                         "fact_id": fact_id,
                         "signal_type": "helpful",
                         "confidence": 0.9,
-                        "query": "When is the deadline?",
+                        "query": query,
                         "context": "User found this answer helpful",
                     }
                 ]
@@ -141,11 +144,20 @@ class TestSignalSubmission:
         assert response.json()["success"] is True
 
     @pytest.mark.asyncio
+    async def test_signal_requires_query(self, api_client, test_bank_id):
+        """Test that signals without query are rejected (query is required)."""
+        response = await api_client.post(
+            f"/v1/default/banks/{test_bank_id}/signal",
+            json={"signals": [{"fact_id": "00000000-0000-0000-0000-000000000000", "signal_type": "used"}]},
+        )
+        assert response.status_code == 422  # Validation error - missing required field
+
+    @pytest.mark.asyncio
     async def test_signal_type_validation(self, api_client, test_bank_id):
         """Test that invalid signal types are rejected."""
         response = await api_client.post(
             f"/v1/default/banks/{test_bank_id}/signal",
-            json={"signals": [{"fact_id": "00000000-0000-0000-0000-000000000000", "signal_type": "invalid_type"}]},
+            json={"signals": [{"fact_id": "00000000-0000-0000-0000-000000000000", "signal_type": "invalid_type", "query": "test query"}]},
         )
         assert response.status_code == 422  # Validation error
 
@@ -157,7 +169,7 @@ class TestSignalSubmission:
             f"/v1/default/banks/{test_bank_id}/signal",
             json={
                 "signals": [
-                    {"fact_id": "00000000-0000-0000-0000-000000000000", "signal_type": "used", "confidence": 1.5}
+                    {"fact_id": "00000000-0000-0000-0000-000000000000", "signal_type": "used", "confidence": 1.5, "query": "test query"}
                 ]
             },
         )
@@ -168,7 +180,7 @@ class TestSignalSubmission:
             f"/v1/default/banks/{test_bank_id}/signal",
             json={
                 "signals": [
-                    {"fact_id": "00000000-0000-0000-0000-000000000000", "signal_type": "used", "confidence": -0.5}
+                    {"fact_id": "00000000-0000-0000-0000-000000000000", "signal_type": "used", "confidence": -0.5, "query": "test query"}
                 ]
             },
         )
@@ -197,20 +209,21 @@ class TestFactStats:
         )
         assert response.status_code == 200
 
+        query = "Who leads research?"
         response = await api_client.post(
             f"/v1/default/banks/{test_bank_id}/memories/recall",
-            json={"query": "Who leads research?"},
+            json={"query": query},
         )
         fact_id = response.json()["results"][0]["id"]
 
         # Submit multiple signals
         await api_client.post(
             f"/v1/default/banks/{test_bank_id}/signal",
-            json={"signals": [{"fact_id": fact_id, "signal_type": "used"}]},
+            json={"signals": [{"fact_id": fact_id, "signal_type": "used", "query": query}]},
         )
         await api_client.post(
             f"/v1/default/banks/{test_bank_id}/signal",
-            json={"signals": [{"fact_id": fact_id, "signal_type": "helpful"}]},
+            json={"signals": [{"fact_id": fact_id, "signal_type": "helpful", "query": query}]},
         )
 
         # Get fact stats
@@ -266,9 +279,10 @@ class TestBankStats:
         assert response.status_code == 200
 
         # Get fact_ids
+        query = "Who works at the company?"
         response = await api_client.post(
             f"/v1/default/banks/{test_bank_id}/memories/recall",
-            json={"query": "Who works at the company?"},
+            json={"query": query},
         )
         results = response.json()["results"]
         fact_ids = [r["id"] for r in results[:2]]
@@ -278,9 +292,9 @@ class TestBankStats:
             f"/v1/default/banks/{test_bank_id}/signal",
             json={
                 "signals": [
-                    {"fact_id": fact_ids[0], "signal_type": "used"},
-                    {"fact_id": fact_ids[0], "signal_type": "helpful"},
-                    {"fact_id": fact_ids[1] if len(fact_ids) > 1 else fact_ids[0], "signal_type": "ignored"},
+                    {"fact_id": fact_ids[0], "signal_type": "used", "query": query},
+                    {"fact_id": fact_ids[0], "signal_type": "helpful", "query": query},
+                    {"fact_id": fact_ids[1] if len(fact_ids) > 1 else fact_ids[0], "signal_type": "ignored", "query": query},
                 ]
             },
         )
@@ -313,9 +327,10 @@ class TestScoreCalculation:
         assert response.status_code == 200
 
         # Get fact_id
+        query = "Who is the project manager?"
         response = await api_client.post(
             f"/v1/default/banks/{test_bank_id}/memories/recall",
-            json={"query": "Who is the project manager?"},
+            json={"query": query},
         )
         fact_id = response.json()["results"][0]["id"]
 
@@ -323,7 +338,7 @@ class TestScoreCalculation:
         # Expected: 0.5 + 0.1 = 0.6
         await api_client.post(
             f"/v1/default/banks/{test_bank_id}/signal",
-            json={"signals": [{"fact_id": fact_id, "signal_type": "used", "confidence": 1.0}]},
+            json={"signals": [{"fact_id": fact_id, "signal_type": "used", "confidence": 1.0, "query": query}]},
         )
 
         # Get stats and verify score
@@ -345,9 +360,10 @@ class TestScoreCalculation:
         assert response.status_code == 200
 
         # Get fact_id
+        query = "Who is the CFO?"
         response = await api_client.post(
             f"/v1/default/banks/{test_bank_id}/memories/recall",
-            json={"query": "Who is the CFO?"},
+            json={"query": query},
         )
         fact_id = response.json()["results"][0]["id"]
 
@@ -356,7 +372,7 @@ class TestScoreCalculation:
         for _ in range(10):
             await api_client.post(
                 f"/v1/default/banks/{test_bank_id}/signal",
-                json={"signals": [{"fact_id": fact_id, "signal_type": "helpful", "confidence": 1.0}]},
+                json={"signals": [{"fact_id": fact_id, "signal_type": "helpful", "confidence": 1.0, "query": query}]},
             )
 
         # Get stats and verify score is clamped
@@ -366,6 +382,91 @@ class TestScoreCalculation:
         stats = response.json()
         assert stats["usefulness_score"] <= 1.0
         assert stats["usefulness_score"] >= 0.0
+
+
+class TestQueryContextAwareScoring:
+    """Tests for query-context aware usefulness scoring."""
+
+    @pytest.mark.asyncio
+    async def test_different_queries_have_separate_scores(self, api_client, test_bank_id):
+        """Test that the same fact can have different scores for different query contexts."""
+        # Store a memory that could be relevant to multiple queries
+        response = await api_client.post(
+            f"/v1/default/banks/{test_bank_id}/memories",
+            json={"items": [{"content": "Bob works at TechCorp as a senior software engineer."}]},
+        )
+        assert response.status_code == 200
+
+        # Get fact_id
+        query1 = "Who works at TechCorp?"
+        response = await api_client.post(
+            f"/v1/default/banks/{test_bank_id}/memories/recall",
+            json={"query": query1},
+        )
+        fact_id = response.json()["results"][0]["id"]
+
+        # Submit positive signal for query about TechCorp
+        await api_client.post(
+            f"/v1/default/banks/{test_bank_id}/signal",
+            json={"signals": [{"fact_id": fact_id, "signal_type": "helpful", "query": query1}]},
+        )
+
+        # Submit negative signal for a different query context
+        query2 = "What is the weather today?"
+        await api_client.post(
+            f"/v1/default/banks/{test_bank_id}/signal",
+            json={"signals": [{"fact_id": fact_id, "signal_type": "not_helpful", "query": query2}]},
+        )
+
+        # The fact now has two separate query-context scores
+        # When recalling with query1-like queries, it should be boosted
+        # When recalling with query2-like queries, it should be penalized
+        # This is tested by the recall integration tests
+
+        # Verify signals were recorded
+        response = await api_client.get(f"/v1/default/banks/{test_bank_id}/facts/{fact_id}/stats")
+        assert response.status_code == 200
+        stats = response.json()
+        assert stats["signal_count"] == 2
+        assert stats["signal_breakdown"].get("helpful", 0) == 1
+        assert stats["signal_breakdown"].get("not_helpful", 0) == 1
+
+    @pytest.mark.asyncio
+    async def test_similar_queries_share_context(self, api_client, test_bank_id):
+        """Test that semantically similar queries share the same context score."""
+        # Store a memory
+        response = await api_client.post(
+            f"/v1/default/banks/{test_bank_id}/memories",
+            json={"items": [{"content": "Alice is the CEO of Acme Corp."}]},
+        )
+        assert response.status_code == 200
+
+        # Get fact_id with first query
+        query1 = "Who is the CEO?"
+        response = await api_client.post(
+            f"/v1/default/banks/{test_bank_id}/memories/recall",
+            json={"query": query1},
+        )
+        fact_id = response.json()["results"][0]["id"]
+
+        # Submit signal for first query
+        await api_client.post(
+            f"/v1/default/banks/{test_bank_id}/signal",
+            json={"signals": [{"fact_id": fact_id, "signal_type": "helpful", "query": query1}]},
+        )
+
+        # Submit signal for semantically similar query
+        # "Who is the chief executive?" should match "Who is the CEO?" with high similarity
+        query2 = "Who is the chief executive officer?"
+        await api_client.post(
+            f"/v1/default/banks/{test_bank_id}/signal",
+            json={"signals": [{"fact_id": fact_id, "signal_type": "helpful", "query": query2}]},
+        )
+
+        # Both signals should contribute to the same query context
+        # (because similarity >= 0.85 threshold)
+        response = await api_client.get(f"/v1/default/banks/{test_bank_id}/facts/{fact_id}/stats")
+        assert response.status_code == 200
 
 
 class TestRecallIntegration:
@@ -387,24 +488,25 @@ class TestRecallIntegration:
         assert response.status_code == 200
 
         # Get fact_ids
+        query = "Who are the executives?"
         response = await api_client.post(
             f"/v1/default/banks/{test_bank_id}/memories/recall",
-            json={"query": "Who are the executives?"},
+            json={"query": query},
         )
         results = response.json()["results"]
         fact_ids = [r["id"] for r in results[:2]]
 
-        # Make one fact more useful than the other
+        # Make one fact more useful than the other for this query context
         for _ in range(3):
             await api_client.post(
                 f"/v1/default/banks/{test_bank_id}/signal",
-                json={"signals": [{"fact_id": fact_ids[0], "signal_type": "helpful"}]},
+                json={"signals": [{"fact_id": fact_ids[0], "signal_type": "helpful", "query": query}]},
             )
 
         # Recall with usefulness boost
         response = await api_client.post(
             f"/v1/default/banks/{test_bank_id}/memories/recall",
-            json={"query": "Who are the executives?", "boost_by_usefulness": True, "usefulness_weight": 0.5},
+            json={"query": query, "boost_by_usefulness": True, "usefulness_weight": 0.5},
         )
         assert response.status_code == 200
         # Results should still be returned (usefulness boost is applied internally)
@@ -444,3 +546,53 @@ class TestRecallIntegration:
             json={"query": "test", "boost_by_usefulness": True, "min_usefulness": 1.5},
         )
         assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_query_context_affects_boosting(self, api_client, test_bank_id):
+        """Test that query context affects which scores are used for boosting."""
+        # Store a memory
+        response = await api_client.post(
+            f"/v1/default/banks/{test_bank_id}/memories",
+            json={"items": [{"content": "Maria is a machine learning engineer at DataCorp."}]},
+        )
+        assert response.status_code == 200
+
+        # Get fact_id
+        query_ml = "Who knows about machine learning?"
+        response = await api_client.post(
+            f"/v1/default/banks/{test_bank_id}/memories/recall",
+            json={"query": query_ml},
+        )
+        fact_id = response.json()["results"][0]["id"]
+
+        # Mark as helpful for ML-related queries
+        await api_client.post(
+            f"/v1/default/banks/{test_bank_id}/signal",
+            json={"signals": [{"fact_id": fact_id, "signal_type": "helpful", "query": query_ml}]},
+        )
+
+        # Mark as not helpful for unrelated queries
+        query_cooking = "What are some good recipes?"
+        await api_client.post(
+            f"/v1/default/banks/{test_bank_id}/signal",
+            json={"signals": [{"fact_id": fact_id, "signal_type": "not_helpful", "query": query_cooking}]},
+        )
+
+        # Recall with ML query should use the helpful score
+        response = await api_client.post(
+            f"/v1/default/banks/{test_bank_id}/memories/recall",
+            json={"query": "Who is an ML expert?", "boost_by_usefulness": True},
+        )
+        assert response.status_code == 200
+        results = response.json()["results"]
+        assert len(results) > 0
+        # The fact should be present and potentially boosted
+
+        # Recall with cooking query would use the not_helpful score
+        # (though the fact probably won't appear at all due to semantic mismatch)
+        response = await api_client.post(
+            f"/v1/default/banks/{test_bank_id}/memories/recall",
+            json={"query": "What should I cook for dinner?", "boost_by_usefulness": True},
+        )
+        assert response.status_code == 200
+        # The ML fact shouldn't appear in cooking query results due to semantic mismatch

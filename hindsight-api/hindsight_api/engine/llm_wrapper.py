@@ -19,10 +19,9 @@ from openai import APIConnectionError, APIStatusError, AsyncOpenAI, LengthFinish
 from ..config import (
     DEFAULT_LLM_MAX_CONCURRENT,
     DEFAULT_LLM_TIMEOUT,
-    DEFAULT_LLM_THINKING_LEVEL,
+    ENV_LLM_GROQ_SERVICE_TIER,
     ENV_LLM_MAX_CONCURRENT,
     ENV_LLM_TIMEOUT,
-    ENV_LLM_THINKING_LEVEL,
 )
 
 # Seed applied to every Groq request for deterministic behavior.
@@ -65,6 +64,7 @@ class LLMProvider:
         base_url: str,
         model: str,
         reasoning_effort: str = "low",
+        groq_service_tier: str | None = None,
     ):
         """
         Initialize LLM provider.
@@ -75,12 +75,15 @@ class LLMProvider:
             base_url: Base URL for the API.
             model: Model name.
             reasoning_effort: Reasoning effort level for supported providers.
+            groq_service_tier: Groq service tier ("on_demand", "flex", "auto"). Default: None (uses Groq's default).
         """
         self.provider = provider.lower()
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
         self.reasoning_effort = reasoning_effort
+        # Default to 'auto' for best performance, users can override to 'on_demand' for free tier
+        self.groq_service_tier = groq_service_tier or os.getenv(ENV_LLM_GROQ_SERVICE_TIER, "auto")
 
         # Validate provider
         valid_providers = ["openai", "groq", "ollama", "gemini", "anthropic", "lmstudio"]
@@ -165,7 +168,7 @@ class LLMProvider:
         response_format: Any | None = None,
         max_completion_tokens: int | None = None,
         temperature: float | None = None,
-        scope: str = "memory",  # Reserved for future metrics/tracing
+        scope: str = "memory",
         max_retries: int = 10,
         initial_backoff: float = 1.0,
         max_backoff: float = 60.0,
@@ -180,7 +183,7 @@ class LLMProvider:
             response_format: Optional Pydantic model for structured output.
             max_completion_tokens: Maximum tokens in response.
             temperature: Sampling temperature (0.0-2.0).
-            scope: Scope identifier for tracking (reserved for future metrics).
+            scope: Scope identifier for tracking.
             max_retries: Maximum retry attempts.
             initial_backoff: Initial backoff time in seconds.
             max_backoff: Maximum backoff time in seconds.
@@ -196,7 +199,6 @@ class LLMProvider:
         """
         async with _global_llm_semaphore:
             start_time = time.time()
-            _ = scope  # Suppress unused warning; reserved for future metrics
 
             # Handle Gemini provider separately
             if self.provider == "gemini":
@@ -237,10 +239,9 @@ class LLMProvider:
                 "messages": messages,
             }
 
-            # Check if model supports reasoning parameter (o1, o3, gpt-5, deepseek, qwq families)
-            # Note: Local reasoning models (qwen, deepseek) output <think> tags which are stripped above
+            # Check if model supports reasoning parameter (o1, o3, gpt-5 families)
             model_lower = self.model.lower()
-            is_reasoning_model = any(x in model_lower for x in ["gpt-5", "o1", "o3", "deepseek", "qwq"])
+            is_reasoning_model = any(x in model_lower for x in ["gpt-5", "o1", "o3", "deepseek"])
 
             # For GPT-4 and GPT-4.1 models, cap max_completion_tokens to 32000
             # For GPT-4o models, cap to 16384
@@ -268,11 +269,15 @@ class LLMProvider:
             # Provider-specific parameters
             if self.provider == "groq":
                 call_params["seed"] = DEFAULT_LLM_SEED
-                extra_body = {"service_tier": "auto"}
-                # Only add reasoning parameters for reasoning models
+                extra_body: dict[str, Any] = {}
+                # Add service_tier if configured (requires paid plan for flex/auto)
+                if self.groq_service_tier:
+                    extra_body["service_tier"] = self.groq_service_tier
+                # Add reasoning parameters for reasoning models
                 if is_reasoning_model:
                     extra_body["include_reasoning"] = False
-                call_params["extra_body"] = extra_body
+                if extra_body:
+                    call_params["extra_body"] = extra_body
 
             last_exception = None
 
@@ -305,8 +310,6 @@ class LLMProvider:
                                     call_params["messages"][0]["content"] = (
                                         schema_msg + "\n\n" + call_params["messages"][0]["content"]
                                     )
-                            # LM Studio and Ollama don't support json_object response format reliably
-                            # We rely on the schema in the system message instead
                             if self.provider not in ("lmstudio", "ollama"):
                                 # LM Studio and Ollama don't support json_object response format reliably
                                 # We rely on the schema in the system message instead
@@ -347,7 +350,6 @@ class LLMProvider:
                                     f"LLM returned empty response after {max_retries + 1} attempts "
                                     f"(finish_reason={finish_reason})"
                                 )
-
 
                         # For local models, they may wrap JSON in markdown code blocks
                         if self.provider in ("lmstudio", "ollama"):
@@ -681,22 +683,9 @@ class LLMProvider:
 
                     # Validate against Pydantic model or return raw JSON
                     if skip_validation:
-                        validated_result = json_data
+                        return json_data
                     else:
-                        validated_result = response_format.model_validate(json_data)
-
-                    # Log slow calls
-                    duration = time.time() - start_time
-                    if duration > 10.0:
-                        eval_count = result.get("eval_count", 0)
-                        prompt_eval_count = result.get("prompt_eval_count", 0)
-                        logger.info(
-                            f"slow llm call: model=ollama/{self.model}, "
-                            f"input_tokens={prompt_eval_count}, output_tokens={eval_count}, "
-                            f"time={duration:.3f}s"
-                        )
-
-                    return validated_result
+                        return response_format.model_validate(json_data)
 
                 except httpx.HTTPStatusError as e:
                     last_exception = e
@@ -791,18 +780,17 @@ class LLMProvider:
         model_lower = self.model.lower()
         is_gemini_3 = "gemini-3" in model_lower or "gemini3" in model_lower
         if is_gemini_3:
-            # Get thinking level from env var (default: low for fast processing)
-            thinking_level_env = os.getenv(ENV_LLM_THINKING_LEVEL, DEFAULT_LLM_THINKING_LEVEL).lower()
+            # Map reasoning_effort to Gemini thinking_level
             thinking_level_map = {
                 "low": "LOW",
                 "medium": "MEDIUM",
                 "high": "HIGH",
             }
-            thinking_level = thinking_level_map.get(thinking_level_env, "LOW")
+            thinking_level = thinking_level_map.get(self.reasoning_effort.lower(), "LOW")
             config_kwargs["thinking_config"] = genai_types.ThinkingConfig(
                 thinking_level=thinking_level
             )
-            logger.debug(f"Gemini 3 thinking_level: {thinking_level}")
+            logger.debug(f"Gemini 3 thinking_level: {thinking_level} (from reasoning_effort: {self.reasoning_effort})")
 
         generation_config = genai_types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
@@ -944,8 +932,9 @@ class LLMProvider:
             raise ValueError("HINDSIGHT_API_LLM_API_KEY environment variable is required")
         base_url = os.getenv("HINDSIGHT_API_LLM_BASE_URL", "")
         model = os.getenv("HINDSIGHT_API_LLM_MODEL", "openai/gpt-oss-120b")
+        reasoning_effort = os.getenv("HINDSIGHT_API_LLM_THINKING_LEVEL", "low")
 
-        return cls(provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort="low")
+        return cls(provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort=reasoning_effort)
 
     @classmethod
     def for_answer_generation(cls) -> "LLMProvider":
@@ -958,8 +947,9 @@ class LLMProvider:
             )
         base_url = os.getenv("HINDSIGHT_API_ANSWER_LLM_BASE_URL", os.getenv("HINDSIGHT_API_LLM_BASE_URL", ""))
         model = os.getenv("HINDSIGHT_API_ANSWER_LLM_MODEL", os.getenv("HINDSIGHT_API_LLM_MODEL", "openai/gpt-oss-120b"))
+        reasoning_effort = os.getenv("HINDSIGHT_API_LLM_THINKING_LEVEL", "high")
 
-        return cls(provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort="high")
+        return cls(provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort=reasoning_effort)
 
     @classmethod
     def for_judge(cls) -> "LLMProvider":
@@ -972,8 +962,9 @@ class LLMProvider:
             )
         base_url = os.getenv("HINDSIGHT_API_JUDGE_LLM_BASE_URL", os.getenv("HINDSIGHT_API_LLM_BASE_URL", ""))
         model = os.getenv("HINDSIGHT_API_JUDGE_LLM_MODEL", os.getenv("HINDSIGHT_API_LLM_MODEL", "openai/gpt-oss-120b"))
+        reasoning_effort = os.getenv("HINDSIGHT_API_LLM_THINKING_LEVEL", "high")
 
-        return cls(provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort="high")
+        return cls(provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort=reasoning_effort)
 
 
 # Backwards compatibility alias

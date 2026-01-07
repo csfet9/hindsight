@@ -645,12 +645,16 @@ class MemoryEngine(MemoryEngineInterface):
 
         # Run database migrations if enabled
         if self._run_migrations:
-            from ..migrations import run_migrations
+            from ..migrations import ensure_embedding_dimension, run_migrations
 
             if not self.db_url:
                 raise ValueError("Database URL is required for migrations")
             logger.info("Running database migrations...")
             run_migrations(self.db_url)
+
+            # Ensure embedding column dimension matches the model's dimension
+            # This is done after migrations and after embeddings.initialize()
+            ensure_embedding_dimension(self.db_url, self.embeddings.dimension)
 
         logger.info(f"Connecting to PostgreSQL at {self.db_url}")
 
@@ -1751,9 +1755,12 @@ class MemoryEngine(MemoryEngineInterface):
             # Step 4.7: Apply usefulness boost if enabled
             if boost_by_usefulness and scored_results:
                 # Get usefulness scores for all candidate facts
+                # Pass query_embedding for query-context aware scoring
                 fact_ids = [sr.id for sr in scored_results]
                 async with acquire_with_retry(pool) as usefulness_conn:
-                    usefulness_scores = await self._get_usefulness_scores_for_facts(usefulness_conn, bank_id, fact_ids)
+                    usefulness_scores = await self._get_usefulness_scores_for_facts(
+                        usefulness_conn, bank_id, fact_ids, query_embedding=query_embedding
+                    )
 
                 # Filter by min_usefulness
                 if min_usefulness > 0.0:
@@ -4153,6 +4160,10 @@ Guidelines:
         "not_helpful": -1.0,
     }
 
+    # Cosine similarity threshold for matching similar queries
+    # Queries with similarity >= this threshold are considered "the same" query context
+    QUERY_SIMILARITY_THRESHOLD = 0.85
+
     async def submit_signals(
         self,
         bank_id: str,
@@ -4162,6 +4173,9 @@ Guidelines:
     ) -> dict[str, Any]:
         """
         Submit feedback signals for facts.
+
+        This method updates both global usefulness scores (for backwards compatibility)
+        and query-context aware scores (for accurate per-query feedback).
 
         Args:
             bank_id: The memory bank ID
@@ -4178,26 +4192,45 @@ Guidelines:
         pool = await self._get_pool()
         updated_facts = set()
 
+        # Step 1: Extract unique queries and generate embeddings
+        unique_queries = list({s["query"] for s in signals if s.get("query")})
+        query_embeddings: dict[str, list[float]] = {}
+
+        if unique_queries:
+            embeddings_list = embedding_utils.generate_embedding(self.embeddings, unique_queries[0])
+            # For batch, we need to generate all embeddings
+            if len(unique_queries) == 1:
+                query_embeddings[unique_queries[0]] = embeddings_list
+            else:
+                # Generate embeddings for all unique queries
+                all_embeddings = await embedding_utils.generate_embeddings_batch(
+                    self.embeddings, unique_queries
+                )
+                for query_text, emb in zip(unique_queries, all_embeddings):
+                    query_embeddings[query_text] = emb
+
         async with acquire_with_retry(pool) as conn:
             async with conn.transaction():
                 for signal in signals:
                     fact_id = signal["fact_id"]
                     signal_type = signal["signal_type"]
                     confidence = signal.get("confidence", 1.0)
-                    query = signal.get("query")
+                    query = signal["query"]  # Now required
                     context = signal.get("context")
 
-                    # Generate query hash if query provided
-                    query_hash = None
-                    if query:
-                        query_hash = hashlib.sha256(query.lower().strip().encode()).hexdigest()[:16]
+                    # Generate query hash for pattern tracking
+                    query_hash = hashlib.sha256(query.lower().strip().encode()).hexdigest()[:16]
 
-                    # Insert signal record
+                    # Get the query embedding
+                    query_embedding = query_embeddings.get(query)
+                    query_embedding_str = str(query_embedding) if query_embedding else None
+
+                    # Insert signal record with query embedding
                     await conn.execute(
                         f"""
                         INSERT INTO {fq_table("usefulness_signals")}
-                        (fact_id, bank_id, signal_type, confidence, query_hash, context)
-                        VALUES ($1, $2, $3, $4, $5, $6)
+                        (fact_id, bank_id, signal_type, confidence, query_hash, context, query_embedding)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
                         """,
                         uuid.UUID(fact_id),
                         bank_id,
@@ -4205,13 +4238,14 @@ Guidelines:
                         confidence,
                         query_hash,
                         context,
+                        query_embedding_str,
                     )
 
                     # Calculate delta for usefulness score
                     weight = self.SIGNAL_WEIGHTS.get(signal_type, 0)
                     delta = weight * confidence * 0.1
 
-                    # Update or insert fact_usefulness with time decay
+                    # Update global fact_usefulness (for backwards compatibility)
                     # Decay formula: new_score = old_score * (0.95 ^ (seconds_since_last_decay / 604800))
                     # 604800 seconds = 1 week
                     await conn.execute(
@@ -4237,32 +4271,85 @@ Guidelines:
                         delta,
                     )
 
+                    # Update query-context aware usefulness (query_fact_usefulness)
+                    if query_embedding:
+                        # Find existing entry with similar query for this fact
+                        # Uses cosine similarity: 1 - cosine_distance
+                        existing_row = await conn.fetchrow(
+                            f"""
+                            SELECT id, usefulness_score, signal_count, last_decay_at,
+                                   1 - (query_embedding <=> $1) as similarity
+                            FROM {fq_table("query_fact_usefulness")}
+                            WHERE bank_id = $2 AND fact_id = $3
+                              AND 1 - (query_embedding <=> $1) >= $4
+                            ORDER BY similarity DESC
+                            LIMIT 1
+                            """,
+                            query_embedding_str,
+                            bank_id,
+                            uuid.UUID(fact_id),
+                            self.QUERY_SIMILARITY_THRESHOLD,
+                        )
+
+                        if existing_row:
+                            # Update existing entry (similar query context exists)
+                            # Apply time decay then new signal
+                            await conn.execute(
+                                f"""
+                                UPDATE {fq_table("query_fact_usefulness")}
+                                SET usefulness_score = GREATEST(0.0, LEAST(1.0,
+                                        (usefulness_score *
+                                         POWER(0.95, EXTRACT(EPOCH FROM (now() - last_decay_at)) / 604800.0))
+                                        + $1
+                                    )),
+                                    signal_count = signal_count + 1,
+                                    last_signal_at = now(),
+                                    last_decay_at = now(),
+                                    updated_at = now()
+                                WHERE id = $2
+                                """,
+                                delta,
+                                existing_row["id"],
+                            )
+                        else:
+                            # Insert new entry (new query context for this fact)
+                            await conn.execute(
+                                f"""
+                                INSERT INTO {fq_table("query_fact_usefulness")}
+                                (bank_id, fact_id, query_embedding, query_example, usefulness_score, signal_count, last_signal_at)
+                                VALUES ($1, $2, $3, $4, GREATEST(0.0, LEAST(1.0, 0.5 + $5)), 1, now())
+                                """,
+                                bank_id,
+                                uuid.UUID(fact_id),
+                                query_embedding_str,
+                                query[:200],  # Store truncated example
+                                delta,
+                            )
+
                     updated_facts.add(fact_id)
 
-                    # Update query pattern stats if query provided
-                    if query_hash:
-                        # Build column name for incrementing
-                        count_column = {
-                            "used": "used_count",
-                            "ignored": "ignored_count",
-                            "helpful": "helpful_count",
-                            "not_helpful": "not_helpful_count",
-                        }.get(signal_type, "used_count")
+                    # Update query pattern stats
+                    count_column = {
+                        "used": "used_count",
+                        "ignored": "ignored_count",
+                        "helpful": "helpful_count",
+                        "not_helpful": "not_helpful_count",
+                    }.get(signal_type, "used_count")
 
-                        await conn.execute(
-                            f"""
-                            INSERT INTO {fq_table("query_pattern_stats")}
-                            (bank_id, query_hash, query_example, total_signals, {count_column})
-                            VALUES ($1, $2, $3, 1, 1)
-                            ON CONFLICT (bank_id, query_hash) DO UPDATE SET
-                                total_signals = query_pattern_stats.total_signals + 1,
-                                {count_column} = query_pattern_stats.{count_column} + 1,
-                                updated_at = now()
-                            """,
-                            bank_id,
-                            query_hash,
-                            query[:200] if query else None,  # Store truncated example
-                        )
+                    await conn.execute(
+                        f"""
+                        INSERT INTO {fq_table("query_pattern_stats")}
+                        (bank_id, query_hash, query_example, total_signals, {count_column})
+                        VALUES ($1, $2, $3, 1, 1)
+                        ON CONFLICT (bank_id, query_hash) DO UPDATE SET
+                            total_signals = query_pattern_stats.total_signals + 1,
+                            {count_column} = query_pattern_stats.{count_column} + 1,
+                            updated_at = now()
+                        """,
+                        bank_id,
+                        query_hash,
+                        query[:200],  # Store truncated example
+                    )
 
         return {
             "success": True,
@@ -4433,14 +4520,21 @@ Guidelines:
         conn,
         bank_id: str,
         fact_ids: list[str],
+        query_embedding: list[float] | None = None,
     ) -> dict[str, float]:
         """
         Get usefulness scores for a list of facts (internal method for recall integration).
+
+        Uses query-context aware scoring when query_embedding is provided:
+        1. First tries to find scores for similar queries (cosine similarity >= 0.85)
+        2. Falls back to global scores for facts without query-specific signals
+        3. Falls back to 0.5 (neutral) for facts without any signals
 
         Args:
             conn: Database connection
             bank_id: The memory bank ID
             fact_ids: List of fact UUIDs
+            query_embedding: Optional query embedding for context-aware scoring
 
         Returns:
             Dict mapping fact_id to usefulness_score (0.5 default for facts without signals)
@@ -4450,21 +4544,65 @@ Guidelines:
 
         uuid_list = [uuid.UUID(fid) for fid in fact_ids]
 
-        rows = await conn.fetch(
-            f"""
-            SELECT
-                fact_id,
-                usefulness_score * POWER(0.95, EXTRACT(EPOCH FROM (now() - last_decay_at)) / 604800.0) as score
-            FROM {fq_table("fact_usefulness")}
-            WHERE fact_id = ANY($1::uuid[]) AND bank_id = $2
-            """,
-            uuid_list,
-            bank_id,
-        )
-
-        # Default to 0.5 (neutral) for facts without signals
+        # Default to 0.5 (neutral) for all facts
         scores = {fid: 0.5 for fid in fact_ids}
-        for row in rows:
-            scores[str(row["fact_id"])] = max(0.0, min(1.0, row["score"]))
+
+        # Step 1: Try query-context aware scores if query_embedding provided
+        if query_embedding:
+            query_embedding_str = str(query_embedding)
+
+            # Find the best matching query context for each fact
+            # Uses cosine similarity to find semantically similar queries
+            query_rows = await conn.fetch(
+                f"""
+                WITH ranked_queries AS (
+                    SELECT
+                        fact_id,
+                        usefulness_score * POWER(0.95, EXTRACT(EPOCH FROM (now() - last_decay_at)) / 604800.0) as score,
+                        1 - (query_embedding <=> $1) as similarity,
+                        ROW_NUMBER() OVER (PARTITION BY fact_id ORDER BY 1 - (query_embedding <=> $1) DESC) as rn
+                    FROM {fq_table("query_fact_usefulness")}
+                    WHERE fact_id = ANY($2::uuid[])
+                      AND bank_id = $3
+                      AND 1 - (query_embedding <=> $1) >= $4
+                )
+                SELECT fact_id, score, similarity
+                FROM ranked_queries
+                WHERE rn = 1
+                """,
+                query_embedding_str,
+                uuid_list,
+                bank_id,
+                self.QUERY_SIMILARITY_THRESHOLD,
+            )
+
+            # Apply query-context scores
+            for row in query_rows:
+                scores[str(row["fact_id"])] = max(0.0, min(1.0, row["score"]))
+
+        # Step 2: Fill in remaining facts with global scores
+        # (facts that didn't have query-specific signals)
+        facts_needing_global = [fid for fid in fact_ids if scores[fid] == 0.5]
+
+        if facts_needing_global:
+            global_uuid_list = [uuid.UUID(fid) for fid in facts_needing_global]
+
+            global_rows = await conn.fetch(
+                f"""
+                SELECT
+                    fact_id,
+                    usefulness_score * POWER(0.95, EXTRACT(EPOCH FROM (now() - last_decay_at)) / 604800.0) as score
+                FROM {fq_table("fact_usefulness")}
+                WHERE fact_id = ANY($1::uuid[]) AND bank_id = $2
+                """,
+                global_uuid_list,
+                bank_id,
+            )
+
+            for row in global_rows:
+                fact_id_str = str(row["fact_id"])
+                # Only update if still at default (0.5) - don't override query-specific scores
+                if scores[fact_id_str] == 0.5:
+                    scores[fact_id_str] = max(0.0, min(1.0, row["score"]))
 
         return scores

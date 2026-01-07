@@ -85,9 +85,9 @@ Submit multiple signals efficiently in a single request:
 </TabItem>
 </Tabs>
 
-### With Query Context
+### With Additional Context
 
-Include the original query for pattern tracking:
+Add optional context description alongside the required query:
 
 <Tabs>
 <TabItem value="python" label="Python">
@@ -98,6 +98,35 @@ Include the original query for pattern tracking:
 </TabItem>
 </Tabs>
 
+## Query-Context Aware Scoring
+
+Feedback signals are tied to query context, not just the fact globally. This means:
+
+- **Same fact, different queries = different scores**: A fact about "database pooling" might score high for queries about "connection management" but low for "authentication" queries.
+- **Semantic matching**: Similar queries share scores. "Who is the CEO?" and "Who is the chief executive?" are considered the same context (cosine similarity ≥ 0.85).
+- **Global fallback**: If no query-specific score exists, the global fact score is used.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Fact: "Use connection pooling"           │
+├─────────────────────────────────────────────────────────────┤
+│  Query Context              │  Usefulness Score             │
+│─────────────────────────────│───────────────────────────────│
+│  "database performance"     │  0.85 (frequently used)       │
+│  "authentication methods"   │  0.35 (often ignored)         │
+│  "API rate limiting"        │  0.50 (global fallback)       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+When recalling with `boost_by_usefulness: true`, the system:
+
+1. Generates an embedding for the recall query
+2. Finds matching query contexts (similarity ≥ 0.85)
+3. Uses query-specific scores when available
+4. Falls back to global scores otherwise
+
+This enables facts to be boosted or deprioritized based on how useful they've been for *similar* queries in the past.
+
 ## Signal Parameters
 
 | Parameter | Type | Required | Description |
@@ -105,8 +134,12 @@ Include the original query for pattern tracking:
 | `fact_id` | string | Yes | UUID of the fact |
 | `signal_type` | string | Yes | `used`, `ignored`, `helpful`, `not_helpful` |
 | `confidence` | float | No | 0.0-1.0, defaults to 1.0 |
-| `query` | string | No | Original query for pattern tracking |
+| `query` | string | **Yes** | The query that triggered this recall |
 | `context` | string | No | Additional context about the signal |
+
+:::warning Query is Required
+The `query` parameter is required to enable query-context aware scoring. This ensures feedback is tied to specific query contexts.
+:::
 
 ## Viewing Statistics
 
