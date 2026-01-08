@@ -142,7 +142,7 @@ docker run -d --name hindsight \
 
 ### Recall Performance
 
-- Average recall time: <0.5s
+- Average recall time: \<0.5s
 - Accurate semantic matching
 - Correct entity linking
 
