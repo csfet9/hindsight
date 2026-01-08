@@ -570,6 +570,10 @@ export type GraphDataResponse = {
    * Total Units
    */
   total_units: number;
+  /**
+   * Limit
+   */
+  limit: number;
 };
 
 /**
@@ -966,6 +970,10 @@ export type ReflectResponse = {
   structured_output?: {
     [key: string]: unknown;
   } | null;
+  /**
+   * Token usage metrics for LLM calls during reflection.
+   */
+  usage?: TokenUsage | null;
 };
 
 /**
@@ -1010,6 +1018,39 @@ export type RetainResponse = {
    * Whether the operation was processed asynchronously
    */
   async: boolean;
+  /**
+   * Token usage metrics for LLM calls during fact extraction (only present for synchronous operations)
+   */
+  usage?: TokenUsage | null;
+};
+
+/**
+ * TokenUsage
+ *
+ * Token usage metrics for LLM calls.
+ *
+ * Tracks input/output tokens for a single request to enable
+ * per-request cost tracking and monitoring.
+ */
+export type TokenUsage = {
+  /**
+   * Input Tokens
+   *
+   * Number of input/prompt tokens consumed
+   */
+  input_tokens?: number;
+  /**
+   * Output Tokens
+   *
+   * Number of output/completion tokens generated
+   */
+  output_tokens?: number;
+  /**
+   * Total Tokens
+   *
+   * Total tokens (input + output)
+   */
+  total_tokens?: number;
 };
 
 /**
@@ -1086,6 +1127,10 @@ export type GetGraphData = {
      * Type
      */
     type?: string | null;
+    /**
+     * Limit
+     */
+    limit?: number;
   };
   url: "/v1/default/banks/{bank_id}/graph";
 };

@@ -14,7 +14,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ...config import get_config
 from ..llm_wrapper import LLMConfig, OutputTooLongError
+from ..response_models import TokenUsage
 
 
 def _infer_temporal_date(fact_text: str, event_date: datetime) -> str | None:
@@ -109,7 +111,7 @@ class Fact(BaseModel):
 
 
 class CausalRelation(BaseModel):
-    """Causal relationship between facts."""
+    """Causal relationship between facts (legacy - embedded in each fact)."""
 
     target_fact_index: int = Field(
         description="Index of the related fact in the facts array (0-based). "
@@ -121,6 +123,36 @@ class CausalRelation(BaseModel):
         "'caused_by' = this fact was caused by the target fact, "
         "'enables' = this fact enables/allows the target fact, "
         "'prevents' = this fact prevents/blocks the target fact"
+    )
+    strength: float = Field(
+        description="Strength of causal relationship (0.0 to 1.0). "
+        "1.0 = direct/strong causation, 0.5 = moderate, 0.3 = weak/indirect",
+        ge=0.0,
+        le=1.0,
+        default=1.0,
+    )
+
+
+class TopLevelCausalRelation(BaseModel):
+    """
+    Causal relationship between two facts (top-level schema).
+
+    This is the preferred format - defined AFTER all facts are extracted,
+    allowing the LLM to see the full list of facts before specifying relationships.
+    """
+
+    from_fact_index: int = Field(
+        description="Index of the source fact (0-based). The fact that causes/enables/prevents."
+    )
+    to_fact_index: int = Field(
+        description="Index of the target fact (0-based). The fact that is caused/enabled/prevented."
+    )
+    relation_type: Literal["causes", "caused_by", "enables", "prevents"] = Field(
+        description="Type of causal relationship: "
+        "'causes' = source fact directly causes the target fact, "
+        "'caused_by' = source fact was caused by the target fact, "
+        "'enables' = source fact enables/allows the target fact, "
+        "'prevents' = source fact prevents/blocks the target fact"
     )
     strength: float = Field(
         description="Strength of causal relationship (0.0 to 1.0). "
@@ -253,9 +285,15 @@ class ExtractedFact(BaseModel):
 
 
 class FactExtractionResponse(BaseModel):
-    """Response containing all extracted facts."""
+    """Response containing all extracted facts and their causal relationships."""
 
     facts: list[ExtractedFact] = Field(description="List of extracted factual statements")
+    causal_relationships: list[TopLevelCausalRelation] | None = Field(
+        default=None,
+        description="Causal relationships between facts. Define these AFTER listing all facts. "
+        "Each relationship specifies from_fact_index -> to_fact_index with a relation type. "
+        "Indices must be valid (0 to N-1 where N is the number of facts).",
+    )
 
 
 def chunk_text(text: str, max_chars: int) -> list[str]:
@@ -356,7 +394,7 @@ async def _extract_facts_from_chunk(
     llm_config: "LLMConfig",
     agent_name: str = None,
     extract_opinions: bool = False,
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], TokenUsage]:
     """
     Extract facts from a single chunk (internal helper for parallel processing).
 
@@ -572,7 +610,53 @@ WHAT TO EXTRACT vs SKIP
 ══════════════════════════════════════════════════════════════════════════
 
 ✅ EXTRACT: User preferences (ALWAYS as separate facts!), feelings, plans, events, relationships, achievements
-❌ SKIP: Greetings, filler ("thanks", "cool"), purely structural statements"""
+❌ SKIP: Greetings, filler ("thanks", "cool"), purely structural statements
+
+══════════════════════════════════════════════════════════════════════════
+CAUSAL RELATIONSHIPS (CRITICAL - DEFINE AFTER ALL FACTS)
+══════════════════════════════════════════════════════════════════════════
+
+⚠️ IMPORTANT: Causal relationships are defined at the TOP LEVEL, AFTER listing all facts!
+
+The `causal_relationships` array goes at the root of your response (NOT inside each fact).
+This allows you to see all facts first before defining how they relate.
+
+Format:
+```json
+{{
+  "facts": [...all your extracted facts...],
+  "causal_relationships": [
+    {{"from_fact_index": 0, "to_fact_index": 1, "relation_type": "causes", "strength": 0.9}},
+    {{"from_fact_index": 1, "to_fact_index": 2, "relation_type": "enables", "strength": 0.7}}
+  ]
+}}
+```
+
+Relationship types:
+- "causes": Fact A directly causes Fact B (A → B)
+- "caused_by": Fact A was caused by Fact B (A ← B)
+- "enables": Fact A enables/allows Fact B to happen
+- "prevents": Fact A prevents/blocks Fact B from happening
+
+⚠️ INDEX VALIDATION: If you extract N facts (indices 0 to N-1), both from_fact_index and to_fact_index MUST be in range [0, N-1].
+
+Example (Event Date: March 15, 2024):
+Input: "I lost my job in January. Because of that, I couldn't pay rent. So I had to move to a cheaper apartment."
+
+Facts extracted:
+- Fact 0: "User lost their job in January due to layoffs"
+- Fact 1: "User couldn't pay rent because of job loss"
+- Fact 2: "User moved to a cheaper apartment"
+
+Causal relationships (at root level):
+```json
+"causal_relationships": [
+  {{"from_fact_index": 0, "to_fact_index": 1, "relation_type": "causes", "strength": 1.0}},
+  {{"from_fact_index": 1, "to_fact_index": 2, "relation_type": "causes", "strength": 0.9}}
+]
+```
+
+This creates a chain: Job loss (0) → Can't pay rent (1) → Moved to cheaper apartment (2)"""
 
     import logging
 
@@ -583,6 +667,7 @@ WHAT TO EXTRACT vs SKIP
     # Retry logic for JSON validation errors
     max_retries = 2
     last_error = None
+    config = get_config()
 
     # Sanitize input text to prevent Unicode encoding errors (e.g., unpaired surrogates)
     sanitized_chunk = _sanitize_text(chunk)
@@ -601,16 +686,19 @@ Context: {sanitized_context}
 Text:
 {sanitized_chunk}"""
 
+    usage = TokenUsage()  # Track cumulative usage across retries
     for attempt in range(max_retries):
         try:
-            extraction_response_json = await llm_config.call(
+            extraction_response_json, call_usage = await llm_config.call(
                 messages=[{"role": "system", "content": prompt}, {"role": "user", "content": user_message}],
                 response_format=FactExtractionResponse,
                 scope="memory_extract_facts",
                 temperature=0.1,
-                max_completion_tokens=8192,
+                max_completion_tokens=config.retain_max_completion_tokens,
                 skip_validation=True,  # Get raw JSON, we'll validate leniently
+                return_usage=True,
             )
+            usage = usage + call_usage  # Aggregate usage across retries
 
             # Lenient parsing of facts from raw JSON
             chunk_facts = []
@@ -628,9 +716,12 @@ Text:
                         f"LLM returned non-dict JSON after {max_retries} attempts: {type(extraction_response_json).__name__}. "
                         f"Raw: {str(extraction_response_json)[:500]}"
                     )
-                    return []
+                    return [], usage
 
             raw_facts = extraction_response_json.get("facts", [])
+            # Get top-level causal relationships (new schema)
+            top_level_causal_relations = extraction_response_json.get("causal_relationships", [])
+
             if not raw_facts:
                 logger.debug(
                     f"LLM response missing 'facts' field or returned empty list. "
@@ -640,6 +731,47 @@ Text:
                     f"context: {context if context else 'none'}, "
                     f"text: {chunk}"
                 )
+
+            # Build a map from fact index to causal relations (from top-level field)
+            # This converts from_fact_index -> [{target_fact_index, relation_type, strength}]
+            causal_relations_by_fact: dict[int, list[dict]] = {}
+            if top_level_causal_relations:
+                num_facts = len(raw_facts)
+                for rel in top_level_causal_relations:
+                    if not isinstance(rel, dict):
+                        continue
+                    from_idx = rel.get("from_fact_index")
+                    to_idx = rel.get("to_fact_index")
+                    relation_type = rel.get("relation_type")
+                    strength = rel.get("strength", 1.0)
+
+                    # Validate indices
+                    if from_idx is None or to_idx is None or relation_type is None:
+                        logger.warning(f"Skipping malformed top-level causal relation: {rel}")
+                        continue
+                    if from_idx < 0 or from_idx >= num_facts:
+                        logger.warning(
+                            f"Invalid from_fact_index {from_idx} in top-level causal relation "
+                            f"(valid range: 0-{num_facts - 1}). Skipping."
+                        )
+                        continue
+                    if to_idx < 0 or to_idx >= num_facts:
+                        logger.warning(
+                            f"Invalid to_fact_index {to_idx} in top-level causal relation "
+                            f"(valid range: 0-{num_facts - 1}). Skipping."
+                        )
+                        continue
+
+                    # Add to the map for the from_fact_index
+                    if from_idx not in causal_relations_by_fact:
+                        causal_relations_by_fact[from_idx] = []
+                    causal_relations_by_fact[from_idx].append(
+                        {
+                            "target_fact_index": to_idx,
+                            "relation_type": relation_type,
+                            "strength": strength,
+                        }
+                    )
 
             for i, llm_fact in enumerate(raw_facts):
                 # Skip non-dict entries but track them for retry
@@ -745,19 +877,40 @@ Text:
                     if validated_entities:
                         fact_data["entities"] = validated_entities
 
-                # Add causal relations if present (validate as CausalRelation objects)
-                # Filter out invalid relations (missing required fields)
-                causal_relations = get_value("causal_relations")
-                if causal_relations:
-                    validated_relations = []
-                    for rel in causal_relations:
+                # Add causal relations from both sources:
+                # 1. Top-level causal_relationships (preferred, new schema)
+                # 2. Per-fact causal_relations (legacy, for backward compatibility)
+                validated_relations = []
+
+                # First, add relations from top-level (already validated above)
+                if i in causal_relations_by_fact:
+                    for rel in causal_relations_by_fact[i]:
+                        try:
+                            validated_relations.append(CausalRelation.model_validate(rel))
+                        except Exception as e:
+                            logger.warning(f"Invalid top-level causal relation for fact {i}: {rel}: {e}")
+
+                # Then, add any legacy per-fact relations (with index validation)
+                legacy_causal_relations = get_value("causal_relations")
+                if legacy_causal_relations:
+                    num_facts = len(raw_facts)
+                    for rel in legacy_causal_relations:
                         if isinstance(rel, dict) and "target_fact_index" in rel and "relation_type" in rel:
-                            try:
-                                validated_relations.append(CausalRelation.model_validate(rel))
-                            except Exception as e:
-                                logger.warning(f"Invalid causal relation {rel}: {e}")
-                    if validated_relations:
-                        fact_data["causal_relations"] = validated_relations
+                            target_idx = rel.get("target_fact_index")
+                            # Validate target index for legacy format too
+                            if target_idx is not None and 0 <= target_idx < num_facts:
+                                try:
+                                    validated_relations.append(CausalRelation.model_validate(rel))
+                                except Exception as e:
+                                    logger.warning(f"Invalid causal relation {rel}: {e}")
+                            else:
+                                logger.warning(
+                                    f"Invalid target_fact_index {target_idx} in per-fact causal relation "
+                                    f"from fact {i} (valid range: 0-{num_facts - 1}). Skipping."
+                                )
+
+                if validated_relations:
+                    fact_data["causal_relations"] = validated_relations
 
                 # Always set mentioned_at to the event_date (when the conversation/document occurred)
                 fact_data["mentioned_at"] = event_date.isoformat()
@@ -778,7 +931,7 @@ Text:
                 )
                 continue
 
-            return chunk_facts
+            return chunk_facts, usage
 
         except BadRequestError as e:
             last_error = e
@@ -805,7 +958,7 @@ async def _extract_facts_with_auto_split(
     llm_config: LLMConfig,
     agent_name: str = None,
     extract_opinions: bool = False,
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], TokenUsage]:
     """
     Extract facts from a chunk with automatic splitting if output exceeds token limits.
 
@@ -823,7 +976,7 @@ async def _extract_facts_with_auto_split(
         extract_opinions: If True, extract ONLY opinions. If False, extract world and agent facts (no opinions)
 
     Returns:
-        List of fact dictionaries extracted from the chunk (possibly from sub-chunks)
+        Tuple of (facts list, token usage) extracted from the chunk (possibly from sub-chunks)
     """
     import logging
 
@@ -902,12 +1055,14 @@ async def _extract_facts_with_auto_split(
 
         # Combine results from both halves
         all_facts = []
-        for sub_result in sub_results:
-            all_facts.extend(sub_result)
+        total_usage = TokenUsage()
+        for sub_facts, sub_usage in sub_results:
+            all_facts.extend(sub_facts)
+            total_usage = total_usage + sub_usage
 
         logger.info(f"Successfully extracted {len(all_facts)} facts from split chunk {chunk_index + 1}")
 
-        return all_facts
+        return all_facts, total_usage
 
 
 async def extract_facts_from_text(
@@ -917,7 +1072,7 @@ async def extract_facts_from_text(
     agent_name: str,
     context: str = "",
     extract_opinions: bool = False,
-) -> tuple[list[Fact], list[tuple[str, int]]]:
+) -> tuple[list[Fact], list[tuple[str, int]], TokenUsage]:
     """
     Extract semantic facts from conversational or narrative text using LLM.
 
@@ -936,9 +1091,10 @@ async def extract_facts_from_text(
         extract_opinions: If True, extract ONLY opinions. If False, extract world and bank facts (no opinions)
 
     Returns:
-        Tuple of (facts, chunks) where:
+        Tuple of (facts, chunks, usage) where:
         - facts: List of Fact model instances
         - chunks: List of tuples (chunk_text, fact_count) for each chunk
+        - usage: Aggregated token usage across all LLM calls
     """
     chunks = chunk_text(text, max_chars=3000)
     tasks = [
@@ -957,10 +1113,12 @@ async def extract_facts_from_text(
     chunk_results = await asyncio.gather(*tasks)
     all_facts = []
     chunk_metadata = []  # [(chunk_text, fact_count), ...]
-    for chunk, chunk_facts in zip(chunks, chunk_results):
+    total_usage = TokenUsage()
+    for chunk, (chunk_facts, chunk_usage) in zip(chunks, chunk_results):
         all_facts.extend(chunk_facts)
         chunk_metadata.append((chunk, len(chunk_facts)))
-    return all_facts, chunk_metadata
+        total_usage = total_usage + chunk_usage
+    return all_facts, chunk_metadata, total_usage
 
 
 # ============================================================================
@@ -981,7 +1139,7 @@ SECONDS_PER_FACT = 10
 
 async def extract_facts_from_contents(
     contents: list[RetainContent], llm_config, agent_name: str, extract_opinions: bool = False
-) -> tuple[list[ExtractedFactType], list[ChunkMetadata]]:
+) -> tuple[list[ExtractedFactType], list[ChunkMetadata], TokenUsage]:
     """
     Extract facts from multiple content items in parallel.
 
@@ -998,10 +1156,10 @@ async def extract_facts_from_contents(
         extract_opinions: If True, extract only opinions; otherwise world/bank facts
 
     Returns:
-        Tuple of (extracted_facts, chunks_metadata)
+        Tuple of (extracted_facts, chunks_metadata, usage)
     """
     if not contents:
-        return [], []
+        return [], [], TokenUsage()
 
     # Step 1: Create parallel fact extraction tasks
     fact_extraction_tasks = []
@@ -1024,11 +1182,15 @@ async def extract_facts_from_contents(
     # Step 3: Flatten and convert to typed objects
     extracted_facts: list[ExtractedFactType] = []
     chunks_metadata: list[ChunkMetadata] = []
+    total_usage = TokenUsage()
 
     global_chunk_idx = 0
     global_fact_idx = 0
 
-    for content_index, (content, (facts_from_llm, chunks_from_llm)) in enumerate(zip(contents, all_fact_results)):
+    for content_index, (content, (facts_from_llm, chunks_from_llm, content_usage)) in enumerate(
+        zip(contents, all_fact_results)
+    ):
+        total_usage = total_usage + content_usage
         chunk_start_idx = global_chunk_idx
 
         # Convert chunk tuples to ChunkMetadata objects
@@ -1082,7 +1244,7 @@ async def extract_facts_from_contents(
     # Step 4: Add time offsets to preserve ordering within each content
     _add_temporal_offsets(extracted_facts, contents)
 
-    return extracted_facts, chunks_metadata
+    return extracted_facts, chunks_metadata, total_usage
 
 
 def _parse_datetime(date_str: str):

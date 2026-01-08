@@ -38,7 +38,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from hindsight_api import MemoryEngine
 from hindsight_api.engine.db_utils import acquire_with_retry
 from hindsight_api.engine.memory_engine import Budget, fq_table
-from hindsight_api.engine.response_models import VALID_RECALL_FACT_TYPES
+from hindsight_api.engine.response_models import VALID_RECALL_FACT_TYPES, TokenUsage
 from hindsight_api.extensions import HttpExtension, OperationValidationError, load_extension
 from hindsight_api.metrics import create_metrics_collector, get_metrics_collector, initialize_metrics
 from hindsight_api.models import RequestContext
@@ -532,7 +532,15 @@ class RetainResponse(BaseModel):
 
     model_config = ConfigDict(
         populate_by_name=True,
-        json_schema_extra={"example": {"success": True, "bank_id": "user123", "items_count": 2, "async": False}},
+        json_schema_extra={
+            "example": {
+                "success": True,
+                "bank_id": "user123",
+                "items_count": 2,
+                "async": False,
+                "usage": {"input_tokens": 500, "output_tokens": 100, "total_tokens": 600},
+            }
+        },
     )
 
     success: bool
@@ -540,6 +548,10 @@ class RetainResponse(BaseModel):
     items_count: int
     is_async: bool = Field(
         alias="async", serialization_alias="async", description="Whether the operation was processed asynchronously"
+    )
+    usage: TokenUsage | None = Field(
+        default=None,
+        description="Token usage metrics for LLM calls during fact extraction (only present for synchronous operations)",
     )
 
 
@@ -640,6 +652,7 @@ class ReflectResponse(BaseModel):
                     "summary": "AI is transformative",
                     "key_points": ["Used in healthcare", "Discussed recently"],
                 },
+                "usage": {"input_tokens": 1500, "output_tokens": 500, "total_tokens": 2000},
             }
         }
     )
@@ -649,6 +662,10 @@ class ReflectResponse(BaseModel):
     structured_output: dict | None = Field(
         default=None,
         description="Structured output parsed according to the request's response_schema. Only present when response_schema was provided in the request.",
+    )
+    usage: TokenUsage | None = Field(
+        default=None,
+        description="Token usage metrics for LLM calls during reflection.",
     )
 
 
@@ -798,6 +815,7 @@ class GraphDataResponse(BaseModel):
                     }
                 ],
                 "total_units": 2,
+                "limit": 1000,
             }
         }
     )
@@ -806,6 +824,7 @@ class GraphDataResponse(BaseModel):
     edges: list[dict[str, Any]]
     table_rows: list[dict[str, Any]]
     total_units: int
+    limit: int
 
 
 class ListMemoryUnitsResponse(BaseModel):
@@ -1217,16 +1236,19 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/graph",
         response_model=GraphDataResponse,
         summary="Get memory graph data",
-        description="Retrieve graph data for visualization, optionally filtered by type (world/experience/opinion). Limited to 1000 most recent items.",
+        description="Retrieve graph data for visualization, optionally filtered by type (world/experience/opinion).",
         operation_id="get_graph",
         tags=["Memory"],
     )
     async def api_graph(
-        bank_id: str, type: str | None = None, request_context: RequestContext = Depends(get_request_context)
+        bank_id: str,
+        type: str | None = None,
+        limit: int = 1000,
+        request_context: RequestContext = Depends(get_request_context),
     ):
         """Get graph data from database, filtered by bank_id and optionally by type."""
         try:
-            data = await app.state.memory.get_graph_data(bank_id, type, request_context=request_context)
+            data = await app.state.memory.get_graph_data(bank_id, type, limit=limit, request_context=request_context)
             return data
         except (AuthenticationError, HTTPException):
             raise
@@ -1461,6 +1483,7 @@ def _register_routes(app: FastAPI):
                 text=core_result.text,
                 based_on=based_on_facts,
                 structured_output=core_result.structured_output,
+                usage=core_result.usage,
             )
 
         except OperationValidationError as e:
@@ -2294,12 +2317,12 @@ def _register_routes(app: FastAPI):
             else:
                 # Synchronous processing: wait for completion (record metrics)
                 with metrics.record_operation("retain", bank_id=bank_id):
-                    result = await app.state.memory.retain_batch_async(
-                        bank_id=bank_id, contents=contents, request_context=request_context
+                    result, usage = await app.state.memory.retain_batch_async(
+                        bank_id=bank_id, contents=contents, request_context=request_context, return_usage=True
                     )
 
                 return RetainResponse.model_validate(
-                    {"success": True, "bank_id": bank_id, "items_count": len(contents), "async": False}
+                    {"success": True, "bank_id": bank_id, "items_count": len(contents), "async": False, "usage": usage}
                 )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
