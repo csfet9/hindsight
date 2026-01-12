@@ -1768,7 +1768,9 @@ class MemoryEngine(MemoryEngineInterface):
                 # Filter by min_usefulness
                 if min_usefulness > 0.0:
                     original_count = len(scored_results)
-                    scored_results = [sr for sr in scored_results if usefulness_scores.get(sr.id, 0.5) >= min_usefulness]
+                    scored_results = [
+                        sr for sr in scored_results if usefulness_scores.get(sr.id, 0.5) >= min_usefulness
+                    ]
                     log_buffer.append(
                         f"  [4.7] Usefulness filter: {original_count} -> {len(scored_results)} results "
                         f"(min_usefulness={min_usefulness})"
@@ -4228,9 +4230,7 @@ Guidelines:
                 query_embeddings[unique_queries[0]] = embeddings_list
             else:
                 # Generate embeddings for all unique queries
-                all_embeddings = await embedding_utils.generate_embeddings_batch(
-                    self.embeddings, unique_queries
-                )
+                all_embeddings = await embedding_utils.generate_embeddings_batch(self.embeddings, unique_queries)
                 for query_text, emb in zip(unique_queries, all_embeddings):
                     query_embeddings[query_text] = emb
 
@@ -4531,11 +4531,19 @@ Guidelines:
                 "total_signals": agg_row["total_signals"] or 0,
                 "signal_distribution": signal_distribution,
                 "top_useful_facts": [
-                    {"fact_id": str(r["fact_id"]), "score": float(r["score"]), "text": r["text"][:100] if r["text"] else ""}
+                    {
+                        "fact_id": str(r["fact_id"]),
+                        "score": float(r["score"]),
+                        "text": r["text"][:100] if r["text"] else "",
+                    }
                     for r in top_facts
                 ],
                 "least_useful_facts": [
-                    {"fact_id": str(r["fact_id"]), "score": float(r["score"]), "text": r["text"][:100] if r["text"] else ""}
+                    {
+                        "fact_id": str(r["fact_id"]),
+                        "score": float(r["score"]),
+                        "text": r["text"][:100] if r["text"] else "",
+                    }
                     for r in bottom_facts
                 ],
             }

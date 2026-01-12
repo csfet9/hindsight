@@ -857,7 +857,11 @@ class LLMProvider:
             config_kwargs["system_instruction"] = system_instruction
         if response_format is not None:
             config_kwargs["response_mime_type"] = "application/json"
-            config_kwargs["response_schema"] = response_format
+            # Extract the actual schema dict from wrapper objects
+            if hasattr(response_format, "model_json_schema"):
+                config_kwargs["response_schema"] = response_format.model_json_schema()
+            else:
+                config_kwargs["response_schema"] = response_format
 
         # Add temperature if provided
         if temperature is not None:
@@ -879,9 +883,7 @@ class LLMProvider:
                 "high": "HIGH",
             }
             thinking_level = thinking_level_map.get(self.reasoning_effort.lower(), "LOW")
-            config_kwargs["thinking_config"] = genai_types.ThinkingConfig(
-                thinking_level=thinking_level
-            )
+            config_kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_level=thinking_level)
             logger.debug(f"Gemini 3 thinking_level: {thinking_level} (from reasoning_effort: {self.reasoning_effort})")
 
         generation_config = genai_types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
@@ -1002,7 +1004,9 @@ class LLMProvider:
                         if e.code == 429:
                             # For rate limits, use minimum 10s backoff, max 120s
                             backoff = min(max(10.0, initial_backoff * (2**attempt)), 120.0)
-                            logger.warning(f"Gemini rate limit hit (429), backing off {backoff:.1f}s (attempt {attempt + 1}/{max_retries + 1})")
+                            logger.warning(
+                                f"Gemini rate limit hit (429), backing off {backoff:.1f}s (attempt {attempt + 1}/{max_retries + 1})"
+                            )
                         else:
                             backoff = min(initial_backoff * (2**attempt), max_backoff)
                         jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
@@ -1016,13 +1020,15 @@ class LLMProvider:
 
             except genai_errors.ClientError as e:
                 # Handle ClientError (includes 429 rate limit)
-                error_code = getattr(e, 'code', None) or 429  # Default to 429 for rate limits
+                error_code = getattr(e, "code", None) or 429  # Default to 429 for rate limits
                 if error_code == 429 or "RESOURCE_EXHAUSTED" in str(e):
                     last_exception = e
                     if attempt < max_retries:
                         # Use longer backoff for rate limits - free tier has 15 RPM
                         backoff = min(max(10.0, initial_backoff * (2**attempt)), 120.0)
-                        logger.warning(f"Gemini rate limit hit, backing off {backoff:.1f}s (attempt {attempt + 1}/{max_retries + 1})")
+                        logger.warning(
+                            f"Gemini rate limit hit, backing off {backoff:.1f}s (attempt {attempt + 1}/{max_retries + 1})"
+                        )
                         jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
                         await asyncio.sleep(backoff + jitter)
                         continue
@@ -1052,7 +1058,9 @@ class LLMProvider:
         model = os.getenv("HINDSIGHT_API_LLM_MODEL", "openai/gpt-oss-120b")
         reasoning_effort = os.getenv("HINDSIGHT_API_LLM_THINKING_LEVEL", "low")
 
-        return cls(provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort=reasoning_effort)
+        return cls(
+            provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort=reasoning_effort
+        )
 
     @classmethod
     def for_answer_generation(cls) -> "LLMProvider":
@@ -1067,7 +1075,9 @@ class LLMProvider:
         model = os.getenv("HINDSIGHT_API_ANSWER_LLM_MODEL", os.getenv("HINDSIGHT_API_LLM_MODEL", "openai/gpt-oss-120b"))
         reasoning_effort = os.getenv("HINDSIGHT_API_LLM_THINKING_LEVEL", "high")
 
-        return cls(provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort=reasoning_effort)
+        return cls(
+            provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort=reasoning_effort
+        )
 
     @classmethod
     def for_judge(cls) -> "LLMProvider":
@@ -1082,7 +1092,9 @@ class LLMProvider:
         model = os.getenv("HINDSIGHT_API_JUDGE_LLM_MODEL", os.getenv("HINDSIGHT_API_LLM_MODEL", "openai/gpt-oss-120b"))
         reasoning_effort = os.getenv("HINDSIGHT_API_LLM_THINKING_LEVEL", "high")
 
-        return cls(provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort=reasoning_effort)
+        return cls(
+            provider=provider, api_key=api_key, base_url=base_url, model=model, reasoning_effort=reasoning_effort
+        )
 
 
 # Backwards compatibility alias

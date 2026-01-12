@@ -75,6 +75,109 @@ def _sanitize_text(text: str) -> str:
     return re.sub(r"[\ud800-\udfff]", "", text)
 
 
+# ============================================================================
+# CONTENT TYPE DETECTION
+# ============================================================================
+
+
+def detect_content_type(text: str) -> str:
+    """
+    Auto-detect content type from text content.
+
+    Analyzes the text for code patterns, diff markers, or natural language
+    to determine the appropriate extraction strategy.
+
+    Args:
+        text: Input text to analyze
+
+    Returns:
+        "code", "diff", or "prose"
+    """
+    lines = text.strip().split("\n")
+    if not lines:
+        return "prose"
+
+    # Check for diff format markers (check first 30 lines for efficiency)
+    diff_indicators = [
+        r"^diff --git",
+        r"^@@\s*-\d+,?\d*\s+\+\d+,?\d*\s*@@",
+        r"^[+-]{3}\s+[ab]/",
+        r"^\+\+\+\s",
+        r"^---\s",
+    ]
+    diff_count = 0
+    for line in lines[:30]:
+        for pattern in diff_indicators:
+            if re.match(pattern, line):
+                diff_count += 1
+    if diff_count >= 2:
+        return "diff"
+
+    # Check for code indicators
+    code_indicators = [
+        r"^(def|async def|class)\s+\w+",  # Python
+        r"^(function|const|let|var|export|import)\s+",  # JavaScript/TypeScript
+        r"^(pub\s+)?(fn|struct|impl|enum|trait|mod)\s+",  # Rust
+        r"^(func|type|package)\s+",  # Go
+        r"^(public|private|protected|static)\s+",  # Java/C#
+        r"^\s*#include\s*<",  # C/C++
+        r"^\s*@\w+(\(|$)",  # Decorators/annotations
+    ]
+
+    code_line_count = 0
+    total_lines = len([line for line in lines if line.strip()])
+
+    for line in lines:
+        stripped = line.strip()
+        for pattern in code_indicators:
+            if re.match(pattern, stripped):
+                code_line_count += 1
+                break
+
+    # Also check for high density of special characters common in code
+    if len(text) > 0:
+        code_chars = sum(1 for c in text if c in "{}[]();:=<>|&!")
+        if code_chars / len(text) > 0.04:
+            code_line_count += 3
+
+    # Check for closing braces (common in code)
+    brace_lines = sum(1 for line in lines if line.strip() in ("}", "};", "},"))
+    code_line_count += brace_lines
+
+    if total_lines > 0 and code_line_count / total_lines > 0.2:
+        return "code"
+
+    return "prose"
+
+
+def detect_code_language(text: str) -> str | None:
+    """
+    Detect programming language from code content.
+
+    Args:
+        text: Code content to analyze
+
+    Returns:
+        Language name ("python", "javascript", etc.) or None if unknown
+    """
+    patterns = {
+        "python": [r"^def\s+\w+", r"^class\s+\w+.*:", r"^import\s+\w+", r"^from\s+\w+\s+import", r"^\s*async def\s+"],
+        "javascript": [r"^(const|let|var)\s+\w+", r"^function\s+\w+", r"=>\s*\{", r"^export\s+(default\s+)?"],
+        "typescript": [r":\s*(string|number|boolean|any|void)\s*[;=\)]", r"^interface\s+\w+", r"^type\s+\w+\s*="],
+        "rust": [r"^fn\s+\w+", r"^struct\s+\w+", r"^impl\s+", r"^use\s+\w+::", r"^pub\s+(fn|struct|enum)"],
+        "go": [r"^func\s+(\([^)]+\)\s*)?\w+", r"^package\s+\w+", r"^import\s+\("],
+        "java": [r"^public\s+class", r"^private\s+", r"@Override", r"^package\s+[\w.]+;"],
+        "cpp": [r"^#include\s*<", r"^namespace\s+\w+", r"::\w+\(", r"^template\s*<"],
+        "csharp": [r"^using\s+[\w.]+;", r"^namespace\s+\w+", r"^\[[\w.]+\]"],
+    }
+
+    for lang, lang_patterns in patterns.items():
+        for pattern in lang_patterns:
+            if re.search(pattern, text, re.MULTILINE):
+                return lang
+    return None
+
+
 class Entity(BaseModel):
     """An entity extracted from text."""
 
@@ -296,16 +399,166 @@ class FactExtractionResponse(BaseModel):
     )
 
 
-def chunk_text(text: str, max_chars: int) -> list[str]:
-    """
-    Split text into chunks, preserving conversation structure when possible.
+# ============================================================================
+# CODE-SPECIFIC EXTRACTION PROMPT
+# ============================================================================
 
-    For JSON conversation arrays (user/assistant turns), splits at turn boundaries
-    while preserving speaker context. For plain text, uses sentence-aware splitting.
+CODE_EXTRACTION_PROMPT = """Extract facts from source code or code changes into structured format.
+
+Focus on WHAT the code does, WHY it was written, and HOW it relates to other code.
+
+══════════════════════════════════════════════════════════════════════════
+CODE FACT EXTRACTION GUIDELINES
+══════════════════════════════════════════════════════════════════════════
+
+For code content, extract facts about:
+1. **Function/Method Purpose**: What does this function do? What problem does it solve?
+2. **Class/Module Structure**: What is the class/module responsible for?
+3. **API Changes**: New endpoints, modified signatures, changed behavior
+4. **Dependencies**: What libraries/modules does this code depend on?
+5. **Design Decisions**: Why was this approach chosen?
+6. **Error Handling**: What errors are caught/raised and why?
+
+══════════════════════════════════════════════════════════════════════════
+FACT DIMENSIONS FOR CODE
+══════════════════════════════════════════════════════════════════════════
+
+1. **what**: WHAT the code does - be specific about functionality
+   - Include function/class names, parameters, return types
+   - Describe the behavior, not just the syntax
+   Example: "Function `calculate_discount` validates percentage input and returns discounted price"
+
+2. **when**: WHEN was this code created/modified (if known from context)
+   - Use commit dates, file dates, or "N/A" if unknown
+
+3. **where**: WHERE in the codebase
+   - File path, module path, line numbers if available
+   Example: "src/utils/pricing.py", "hindsight_api/engine/retain/"
+
+4. **who**: WHO wrote or maintains this code
+   - Developer names, team names, or "N/A" if unknown
+
+5. **why**: WHY this code exists - the motivation
+   - Bug fix, feature request, performance improvement, refactoring
+   - Include issue/ticket references if mentioned
+   Example: "Fixes #432 - users reported incorrect tax calculations"
+
+══════════════════════════════════════════════════════════════════════════
+CODE ENTITY EXTRACTION (CRITICAL)
+══════════════════════════════════════════════════════════════════════════
+
+Extract code-specific entities - these are ESSENTIAL for linking related code facts:
+
+- **Function names**: `calculate_total`, `getUserById`, `async_fetch_data`
+- **Class names**: `PaymentProcessor`, `UserService`, `DatabaseConnection`
+- **Module/file paths**: `utils.helpers`, `@/components/Button`, `crate::models`
+- **Libraries**: `numpy`, `react`, `tokio`, `pandas`
+- **API endpoints**: `/api/v1/users`, `POST /payments`
+- **Error types**: `ValueError`, `NotFoundError`, `AuthenticationError`
+- **Configuration keys**: `DATABASE_URL`, `API_KEY`, `MAX_RETRIES`
+
+✅ CORRECT: entities=["calculate_discount", "pricing", "Python", "ValueError"]
+✅ CORRECT: entities=["UserService", "get_user", "authentication", "JWT"]
+❌ WRONG: entities=["function", "code", "file"] - too generic!
+
+══════════════════════════════════════════════════════════════════════════
+DIFF-SPECIFIC EXTRACTION
+══════════════════════════════════════════════════════════════════════════
+
+For git diffs, focus on WHAT CHANGED:
+- Lines starting with `+` are ADDITIONS
+- Lines starting with `-` are DELETIONS
+- `@@ -X,Y +A,B @@` shows line numbers
+
+Extract:
+- What was added/removed/modified
+- Which functions/classes were affected
+- The purpose of the change (from context)
+
+Example diff fact:
+- what: "Added error message to 404 response in `get_user` function, changed from `error(404)` to `error(404, 'User not found')`"
+- where: "src/api/users.py lines 45-47"
+- why: "Improved error messaging for API consumers"
+- entities: ["get_user", "error", "404", "API"]
+
+══════════════════════════════════════════════════════════════════════════
+CODE STRUCTURE METADATA
+══════════════════════════════════════════════════════════════════════════
+
+For each code-related fact, provide structured metadata when applicable:
+- code_type: "function", "class", "module", "config", "test", "api"
+- language: "python", "javascript", "typescript", "rust", "go", etc.
+- name: The primary identifier (function name, class name, etc.)
+- signature: Full signature for functions/methods
+
+══════════════════════════════════════════════════════════════════════════
+EXAMPLES
+══════════════════════════════════════════════════════════════════════════
+
+Example 1 - Python Function:
+Input:
+```python
+def calculate_discount(price: float, percentage: float) -> float:
+    \"\"\"Calculate discounted price with input validation.\"\"\"
+    if percentage < 0 or percentage > 100:
+        raise ValueError("Percentage must be between 0 and 100")
+    return price * (1 - percentage / 100)
+```
+
+Output fact:
+- what: "Function `calculate_discount` calculates discounted price from original price and percentage, with input validation that raises ValueError for invalid percentages"
+- when: "N/A"
+- where: "N/A"
+- who: "N/A"
+- why: "Provides reusable discount calculation with defensive input validation"
+- fact_type: "world"
+- fact_kind: "conversation"
+- entities: ["calculate_discount", "price", "discount", "Python", "ValueError"]
+
+Example 2 - Git Diff:
+Input:
+```diff
+diff --git a/src/api.py b/src/api.py
+@@ -45,3 +45,5 @@ def get_user(user_id):
+   if not user:
+-    return error(404)
++    return error(404, "User not found")
++  if user.deleted_at:
++    return error(404, "User not found")
+```
+
+Output fact:
+- what: "Modified `get_user` function to include descriptive error message for 404 responses and added soft-delete check"
+- when: "N/A"
+- where: "src/api.py lines 45-50"
+- who: "N/A"
+- why: "Improved API error messages and added handling for soft-deleted users"
+- fact_type: "world"
+- fact_kind: "event"
+- entities: ["get_user", "error", "soft-delete", "API", "404"]
+
+══════════════════════════════════════════════════════════════════════════
+FACT TYPE CLASSIFICATION
+══════════════════════════════════════════════════════════════════════════
+
+- **world**: Code facts that describe what the code does (most code facts)
+- **assistant**: When an AI assistant wrote or recommended the code
+"""
+
+
+def chunk_text(text: str, max_chars: int, content_type: str = "auto") -> list[str]:
+    """
+    Split text into chunks, using content-type-appropriate strategy.
+
+    For JSON conversation arrays, splits at turn boundaries.
+    For code, splits at function/class boundaries.
+    For diffs, splits at file boundaries.
+    For prose, uses sentence-aware splitting.
 
     Args:
-        text: Input text to chunk (plain text or JSON conversation)
-        max_chars: Maximum characters per chunk (default 120k ≈ 30k tokens)
+        text: Input text to chunk (plain text, code, diff, or JSON conversation)
+        max_chars: Maximum characters per chunk
+        content_type: "prose", "code", "diff", or "auto" (auto-detect)
 
     Returns:
         List of text chunks, roughly under max_chars
@@ -316,6 +569,17 @@ def chunk_text(text: str, max_chars: int) -> list[str]:
     if len(text) <= max_chars:
         return [text]
 
+    # Auto-detect content type if needed
+    if content_type == "auto":
+        content_type = detect_content_type(text)
+
+    # Route to appropriate chunking strategy
+    if content_type == "code":
+        language = detect_code_language(text)
+        return _chunk_code(text, max_chars, language)
+    elif content_type == "diff":
+        return _chunk_diff(text, max_chars)
+
     # Try to parse as JSON conversation array
     try:
         parsed = json.loads(text)
@@ -325,7 +589,7 @@ def chunk_text(text: str, max_chars: int) -> list[str]:
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Fall back to sentence-aware text splitting
+    # Fall back to sentence-aware text splitting for prose
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=max_chars,
         chunk_overlap=0,
@@ -385,6 +649,186 @@ def _chunk_conversation(turns: list[dict], max_chars: int) -> list[str]:
     return chunks if chunks else [json.dumps(turns, ensure_ascii=False)]
 
 
+def _chunk_code(text: str, max_chars: int, language: str | None = None) -> list[str]:
+    """
+    Split code into chunks at function/class boundaries.
+
+    Unlike prose chunking, this preserves complete code units
+    (functions, classes, methods) when possible.
+
+    Args:
+        text: Source code to chunk
+        max_chars: Maximum characters per chunk
+        language: Optional language hint (not currently used but reserved for future)
+
+    Returns:
+        List of code chunks
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    # Define boundary patterns for different languages
+    boundary_patterns = [
+        # Python
+        r"^(def\s+\w+|async\s+def\s+\w+|class\s+\w+)",
+        # JavaScript/TypeScript
+        r"^(function\s+\w+|const\s+\w+\s*=\s*(?:async\s+)?\(|class\s+\w+)",
+        r"^(export\s+(?:default\s+)?(?:function|class|const))",
+        # Rust
+        r"^(fn\s+\w+|impl\s+\w+|struct\s+\w+|enum\s+\w+|mod\s+\w+)",
+        # Go
+        r"^(func\s+(?:\([^)]+\)\s*)?\w+)",
+        # Java/C#
+        r"^(\s*(?:public|private|protected)\s+(?:static\s+)?(?:class|void|int|String|async))",
+    ]
+
+    # Find all boundary positions
+    boundary_positions = [0]
+    lines = text.split("\n")
+    char_pos = 0
+
+    for line in lines:
+        for pattern in boundary_patterns:
+            if re.match(pattern, line.strip()):
+                if char_pos > 0:  # Don't add 0 twice
+                    boundary_positions.append(char_pos)
+                break
+        char_pos += len(line) + 1  # +1 for newline
+
+    boundary_positions.append(len(text))
+    boundary_positions = sorted(set(boundary_positions))
+
+    # Group boundaries into chunks that fit within max_chars
+    chunks = []
+    current_start = 0
+    current_end = 0
+
+    for pos in boundary_positions[1:]:
+        chunk_size = pos - current_start
+
+        if chunk_size <= max_chars:
+            current_end = pos
+        else:
+            # Save current chunk if not empty
+            if current_end > current_start:
+                chunk_content = text[current_start:current_end].strip()
+                if chunk_content:
+                    chunks.append(chunk_content)
+            elif pos - current_start > max_chars:
+                # Single unit too large - fall back to line-based split
+                large_chunk = text[current_start:pos]
+                sub_chunks = _split_large_code_block(large_chunk, max_chars)
+                chunks.extend(sub_chunks)
+                current_start = pos
+                current_end = pos
+                continue
+
+            current_start = current_end if current_end > current_start else current_start
+            current_end = pos
+
+    # Add remaining content
+    if current_end > current_start:
+        chunk_content = text[current_start:current_end].strip()
+        if chunk_content:
+            chunks.append(chunk_content)
+    elif current_start < len(text):
+        chunk_content = text[current_start:].strip()
+        if chunk_content:
+            chunks.append(chunk_content)
+
+    return chunks if chunks else [text]
+
+
+def _split_large_code_block(text: str, max_chars: int) -> list[str]:
+    """
+    Split a large code block that doesn't have natural boundaries.
+
+    Falls back to line-based splitting when a single code unit exceeds max_chars.
+
+    Args:
+        text: Large code block to split
+        max_chars: Maximum characters per chunk
+
+    Returns:
+        List of code chunks
+    """
+    chunks = []
+    lines = text.split("\n")
+    current_chunk: list[str] = []
+    current_size = 0
+
+    for line in lines:
+        line_size = len(line) + 1  # +1 for newline
+        if current_size + line_size > max_chars and current_chunk:
+            chunks.append("\n".join(current_chunk))
+            current_chunk = []
+            current_size = 0
+        current_chunk.append(line)
+        current_size += line_size
+
+    if current_chunk:
+        chunks.append("\n".join(current_chunk))
+
+    return [c for c in chunks if c.strip()]
+
+
+def _chunk_diff(text: str, max_chars: int) -> list[str]:
+    """
+    Split git diff into chunks at file boundaries.
+
+    Preserves complete file diffs when possible, splitting only when
+    a single file's diff exceeds max_chars.
+
+    Args:
+        text: Git diff content
+        max_chars: Maximum characters per chunk
+
+    Returns:
+        List of diff chunks
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    # Split at file boundaries (diff --git or --- a/)
+    file_pattern = r"^(diff --git|---\s+[ab]/)"
+
+    file_positions = [0]
+    for match in re.finditer(file_pattern, text, re.MULTILINE):
+        if match.start() > 0:
+            file_positions.append(match.start())
+    file_positions.append(len(text))
+
+    chunks = []
+    current_start = 0
+    current_end = 0
+
+    for pos in file_positions[1:]:
+        if pos - current_start <= max_chars:
+            current_end = pos
+        else:
+            if current_end > current_start:
+                chunk_content = text[current_start:current_end].strip()
+                if chunk_content:
+                    chunks.append(chunk_content)
+            # If a single file diff is too large, split it by hunks
+            if pos - (current_end if current_end > current_start else current_start) > max_chars:
+                large_diff = text[current_end if current_end > current_start else current_start : pos]
+                sub_chunks = _split_large_code_block(large_diff, max_chars)
+                chunks.extend(sub_chunks)
+                current_start = pos
+                current_end = pos
+                continue
+            current_start = current_end if current_end > current_start else current_start
+            current_end = pos
+
+    if current_end > current_start:
+        chunk_content = text[current_start:current_end].strip()
+        if chunk_content:
+            chunks.append(chunk_content)
+
+    return chunks if chunks else [text]
+
+
 async def _extract_facts_from_chunk(
     chunk: str,
     chunk_index: int,
@@ -394,9 +838,21 @@ async def _extract_facts_from_chunk(
     llm_config: "LLMConfig",
     agent_name: str = None,
     extract_opinions: bool = False,
+    content_type: str = "prose",
 ) -> tuple[list[dict[str, str]], TokenUsage]:
     """
     Extract facts from a single chunk (internal helper for parallel processing).
+
+    Args:
+        chunk: Text chunk to extract facts from
+        chunk_index: Index of this chunk in the batch
+        total_chunks: Total number of chunks being processed
+        event_date: Reference date for resolving relative times
+        context: Context about the content
+        llm_config: LLM configuration
+        agent_name: Agent name for agent-related fact detection
+        extract_opinions: If True, extract only opinions
+        content_type: "prose", "code", or "diff" - affects extraction prompt
 
     Note: event_date parameter is kept for backward compatibility but not used in prompt.
     The LLM extracts temporal information from the context string instead.
@@ -413,7 +869,16 @@ async def _extract_facts_from_chunk(
             "Extract ONLY 'world' and 'assistant' type facts. DO NOT extract opinions - those are extracted separately."
         )
 
-    prompt = f"""Extract facts from text into structured format with FOUR required dimensions - BE EXTREMELY DETAILED.
+    # Use code-specific prompt for code and diff content
+    use_code_prompt = content_type in ("code", "diff")
+
+    # Select appropriate prompt based on content type
+    if use_code_prompt:
+        prompt = f"""{CODE_EXTRACTION_PROMPT}
+
+{fact_types_instruction}"""
+    else:
+        prompt = f"""Extract facts from text into structured format with FOUR required dimensions - BE EXTREMELY DETAILED.
 
 {fact_types_instruction}
 
@@ -958,6 +1423,7 @@ async def _extract_facts_with_auto_split(
     llm_config: LLMConfig,
     agent_name: str = None,
     extract_opinions: bool = False,
+    content_type: str = "prose",
 ) -> tuple[list[dict[str, str]], TokenUsage]:
     """
     Extract facts from a chunk with automatic splitting if output exceeds token limits.
@@ -974,6 +1440,7 @@ async def _extract_facts_with_auto_split(
         llm_config: LLM configuration to use
         agent_name: Optional agent name (memory owner)
         extract_opinions: If True, extract ONLY opinions. If False, extract world and agent facts (no opinions)
+        content_type: "prose", "code", or "diff" - affects extraction prompt
 
     Returns:
         Tuple of (facts list, token usage) extracted from the chunk (possibly from sub-chunks)
@@ -993,6 +1460,7 @@ async def _extract_facts_with_auto_split(
             llm_config=llm_config,
             agent_name=agent_name,
             extract_opinions=extract_opinions,
+            content_type=content_type,
         )
     except OutputTooLongError:
         # Output exceeded token limits - split the chunk in half and retry
@@ -1038,6 +1506,7 @@ async def _extract_facts_with_auto_split(
                 llm_config=llm_config,
                 agent_name=agent_name,
                 extract_opinions=extract_opinions,
+                content_type=content_type,
             ),
             _extract_facts_with_auto_split(
                 chunk=second_half,
@@ -1048,6 +1517,7 @@ async def _extract_facts_with_auto_split(
                 llm_config=llm_config,
                 agent_name=agent_name,
                 extract_opinions=extract_opinions,
+                content_type=content_type,
             ),
         ]
 
@@ -1072,6 +1542,7 @@ async def extract_facts_from_text(
     agent_name: str,
     context: str = "",
     extract_opinions: bool = False,
+    content_type: str = "auto",
 ) -> tuple[list[Fact], list[tuple[str, int]], TokenUsage]:
     """
     Extract semantic facts from conversational or narrative text using LLM.
@@ -1089,6 +1560,7 @@ async def extract_facts_from_text(
         llm_config: LLM configuration to use
         agent_name: Agent name (memory owner)
         extract_opinions: If True, extract ONLY opinions. If False, extract world and bank facts (no opinions)
+        content_type: "prose", "code", "diff", or "auto" (auto-detect)
 
     Returns:
         Tuple of (facts, chunks, usage) where:
@@ -1096,7 +1568,13 @@ async def extract_facts_from_text(
         - chunks: List of tuples (chunk_text, fact_count) for each chunk
         - usage: Aggregated token usage across all LLM calls
     """
-    chunks = chunk_text(text, max_chars=3000)
+    # Auto-detect content type if needed
+    actual_content_type = content_type
+    if content_type == "auto":
+        actual_content_type = detect_content_type(text)
+
+    # Use content-aware chunking
+    chunks = chunk_text(text, max_chars=3000, content_type=actual_content_type)
     tasks = [
         _extract_facts_with_auto_split(
             chunk=chunk,
@@ -1107,6 +1585,7 @@ async def extract_facts_from_text(
             llm_config=llm_config,
             agent_name=agent_name,
             extract_opinions=extract_opinions,
+            content_type=actual_content_type,
         )
         for i, chunk in enumerate(chunks)
     ]
@@ -1173,6 +1652,7 @@ async def extract_facts_from_contents(
             llm_config=llm_config,
             agent_name=agent_name,
             extract_opinions=extract_opinions,
+            content_type=item.content_type,
         )
         fact_extraction_tasks.append(task)
 

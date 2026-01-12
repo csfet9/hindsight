@@ -7,8 +7,11 @@ from content input to fact storage.
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TypedDict
+from typing import Literal, TypedDict
 from uuid import UUID
+
+# Content type for distinguishing code from prose
+ContentTypeLiteral = Literal["prose", "code", "diff", "auto"]
 
 
 class RetainContentDict(TypedDict, total=False):
@@ -29,6 +32,7 @@ class RetainContentDict(TypedDict, total=False):
     metadata: dict[str, str]
     document_id: str
     entities: list[dict[str, str]]  # [{"text": "...", "type": "..."}]
+    content_type: ContentTypeLiteral  # "prose", "code", "diff", or "auto"
 
 
 def _now_utc() -> datetime:
@@ -49,6 +53,7 @@ class RetainContent:
     event_date: datetime = field(default_factory=_now_utc)
     metadata: dict[str, str] = field(default_factory=dict)
     entities: list[dict[str, str]] = field(default_factory=list)  # User-provided entities
+    content_type: str = "auto"  # "prose", "code", "diff", or "auto"
 
 
 @dataclass
@@ -92,6 +97,24 @@ class CausalRelation:
 
 
 @dataclass
+class CodeStructure:
+    """
+    Structured code metadata extracted from code content.
+
+    Used to store structured information about code entities like
+    functions, classes, modules, etc.
+    """
+
+    code_type: str | None = None  # "function", "class", "module", "config", "test", "api"
+    language: str | None = None  # "python", "javascript", "typescript", "rust", "go", etc.
+    name: str | None = None  # Function/class/module name
+    signature: str | None = None  # Function signature or class definition
+    file_path: str | None = None  # Source file path if known
+    line_start: int | None = None  # Start line number
+    line_end: int | None = None  # End line number
+
+
+@dataclass
 class ExtractedFact:
     """
     Fact extracted from content by the LLM.
@@ -113,6 +136,9 @@ class ExtractedFact:
     context: str = ""
     mentioned_at: datetime | None = None
     metadata: dict[str, str] = field(default_factory=dict)
+
+    # Code-specific structured data (only populated for code content)
+    code_structure: CodeStructure | None = None
 
 
 @dataclass

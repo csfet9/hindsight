@@ -84,18 +84,18 @@ class SignalItem(BaseModel):
     fact_id: str = Field(description="UUID of the fact to signal")
     signal_type: SignalType = Field(description="Type of signal")
 
-    @field_validator('fact_id')
+    @field_validator("fact_id")
     @classmethod
     def validate_uuid(cls, v: str) -> str:
         try:
             uuid.UUID(v)
         except ValueError:
-            raise ValueError(f'fact_id must be a valid UUID, got: {v}')
+            raise ValueError(f"fact_id must be a valid UUID, got: {v}")
         return v
+
     confidence: float = Field(default=1.0, ge=0.0, le=1.0, description="Confidence in the signal (0.0-1.0)")
     query: str = Field(
-        min_length=1,
-        description="The query that triggered this recall (required for query-context aware scoring)"
+        min_length=1, description="The query that triggered this recall (required for query-context aware scoring)"
     )
     context: str | None = Field(default=None, description="Optional context about the signal")
 
@@ -449,6 +449,22 @@ class RecallResponse(BaseModel):
     chunks: dict[str, ChunkData] | None = Field(default=None, description="Chunks for facts, keyed by chunk_id")
 
 
+class ContentType(str, Enum):
+    """Content type classification for memory items.
+
+    Affects how content is chunked and what extraction prompt is used:
+    - PROSE: Natural language text (default) - sentence-aware chunking
+    - CODE: Source code - function/class boundary chunking
+    - DIFF: Git diff/patch format - file boundary chunking
+    - AUTO: Auto-detect based on content patterns
+    """
+
+    PROSE = "prose"
+    CODE = "code"
+    DIFF = "diff"
+    AUTO = "auto"
+
+
 class EntityInput(BaseModel):
     """Entity to associate with retained content."""
 
@@ -468,6 +484,7 @@ class MemoryItem(BaseModel):
                 "metadata": {"source": "slack", "channel": "engineering"},
                 "document_id": "meeting_notes_2024_01_15",
                 "entities": [{"text": "Alice"}, {"text": "ML model", "type": "CONCEPT"}],
+                "content_type": "auto",
             }
         },
     )
@@ -480,6 +497,10 @@ class MemoryItem(BaseModel):
     entities: list[EntityInput] | None = Field(
         default=None,
         description="Optional entities to combine with auto-extracted entities.",
+    )
+    content_type: ContentType = Field(
+        default=ContentType.AUTO,
+        description="Content type: 'prose' (natural language), 'code' (source code), 'diff' (git diff), or 'auto' (auto-detect). Affects chunking and extraction.",
     )
 
     @field_validator("timestamp", mode="before")
@@ -2301,6 +2322,8 @@ def _register_routes(app: FastAPI):
                     content_dict["document_id"] = item.document_id
                 if item.entities:
                     content_dict["entities"] = [{"text": e.text, "type": e.type or "CONCEPT"} for e in item.entities]
+                # Pass content_type for code-aware extraction
+                content_dict["content_type"] = item.content_type.value
                 contents.append(content_dict)
 
             if request.async_:

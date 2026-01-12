@@ -93,6 +93,7 @@ async def retain_batch(
             event_date=item.get("event_date") or utcnow(),
             metadata=item.get("metadata", {}),
             entities=item.get("entities", []),
+            content_type=item.get("content_type", "auto"),
         )
         contents.append(content)
 
