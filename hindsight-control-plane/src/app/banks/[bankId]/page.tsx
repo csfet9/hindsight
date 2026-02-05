@@ -9,18 +9,22 @@ import { EntitiesView } from "@/components/entities-view";
 import { ThinkView } from "@/components/think-view";
 import { SearchDebugView } from "@/components/search-debug-view";
 import { BankProfileView } from "@/components/bank-profile-view";
+import { MentalModelsView } from "@/components/mental-models-view";
+import { useFeatures } from "@/lib/features-context";
 
 type NavItem = "recall" | "reflect" | "data" | "documents" | "entities" | "profile";
-type DataSubTab = "world" | "experience" | "opinion";
+type DataSubTab = "world" | "experience" | "observations" | "mental-models";
 
 export default function BankPage() {
   const params = useParams();
   const router = useRouter();
   const searchParams = useSearchParams();
+  const { features } = useFeatures();
 
   const bankId = params.bankId as string;
   const view = (searchParams.get("view") || "profile") as NavItem;
   const subTab = (searchParams.get("subTab") || "world") as DataSubTab;
+  const observationsEnabled = features?.observations ?? false;
 
   const handleTabChange = (tab: NavItem) => {
     router.push(`/banks/${bankId}?view=${tab}`);
@@ -54,7 +58,7 @@ export default function BankPage() {
             {/* Recall Tab */}
             {view === "recall" && (
               <div>
-                <h1 className="text-3xl font-bold mb-2 text-foreground">Recall Analyzer</h1>
+                <h1 className="text-3xl font-bold mb-2 text-foreground">Recall</h1>
                 <p className="text-muted-foreground mb-6">
                   Analyze memory recall with detailed trace information and retrieval methods.
                 </p>
@@ -67,7 +71,8 @@ export default function BankPage() {
               <div>
                 <h1 className="text-3xl font-bold mb-2 text-foreground">Reflect</h1>
                 <p className="text-muted-foreground mb-6">
-                  Ask questions and get AI-powered answers based on stored memories.
+                  Run an agentic loop that autonomously gathers evidence and reasons through the
+                  lens of the bank&apos;s disposition to generate contextual responses.
                 </p>
                 <ThinkView />
               </div>
@@ -110,15 +115,33 @@ export default function BankPage() {
                       )}
                     </button>
                     <button
-                      onClick={() => handleDataSubTabChange("opinion")}
+                      onClick={() => handleDataSubTabChange("observations")}
                       className={`px-6 py-3 font-semibold text-sm transition-all relative ${
-                        subTab === "opinion"
+                        subTab === "observations"
                           ? "text-primary"
                           : "text-muted-foreground hover:text-foreground"
                       }`}
                     >
-                      Opinions
-                      {subTab === "opinion" && (
+                      Observations
+                      {!observationsEnabled && (
+                        <span className="ml-2 text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
+                          Off
+                        </span>
+                      )}
+                      {subTab === "observations" && (
+                        <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary" />
+                      )}
+                    </button>
+                    <button
+                      onClick={() => handleDataSubTabChange("mental-models")}
+                      className={`px-6 py-3 font-semibold text-sm transition-all relative ${
+                        subTab === "mental-models"
+                          ? "text-primary"
+                          : "text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      Mental Models
+                      {subTab === "mental-models" && (
                         <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary" />
                       )}
                     </button>
@@ -126,9 +149,71 @@ export default function BankPage() {
                 </div>
 
                 <div>
-                  {subTab === "world" && <DataView key="world" factType="world" />}
-                  {subTab === "experience" && <DataView key="experience" factType="experience" />}
-                  {subTab === "opinion" && <DataView key="opinion" factType="opinion" />}
+                  {subTab === "world" && (
+                    <div>
+                      <p className="text-sm text-muted-foreground mb-4">
+                        Objective facts about the world received from external sources.
+                      </p>
+                      <DataView key="world" factType="world" />
+                    </div>
+                  )}
+                  {subTab === "experience" && (
+                    <div>
+                      <p className="text-sm text-muted-foreground mb-4">
+                        The bank&apos;s own actions, interactions, and first-person experiences.
+                      </p>
+                      <DataView key="experience" factType="experience" />
+                    </div>
+                  )}
+                  {subTab === "observations" &&
+                    (observationsEnabled ? (
+                      <div>
+                        <p className="text-sm text-muted-foreground mb-4">
+                          Consolidated knowledge synthesized from facts — patterns, preferences, and
+                          learnings that emerge from accumulated evidence.
+                        </p>
+                        <DataView key="observations" factType="observation" />
+                      </div>
+                    ) : (
+                      <div className="flex flex-col items-center justify-center py-16 text-center">
+                        <div className="text-muted-foreground mb-2">
+                          <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            width="48"
+                            height="48"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.5"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          >
+                            <path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2Z" />
+                            <path d="M12 8v4" />
+                            <path d="M12 16h.01" />
+                          </svg>
+                        </div>
+                        <h3 className="text-lg font-semibold text-foreground mb-1">
+                          Observations Not Enabled
+                        </h3>
+                        <p className="text-sm text-muted-foreground max-w-md">
+                          Observations consolidation is disabled on this server. Set{" "}
+                          <code className="px-1 py-0.5 bg-muted rounded text-xs">
+                            HINDSIGHT_API_ENABLE_OBSERVATIONS=true
+                          </code>{" "}
+                          to enable.
+                        </p>
+                      </div>
+                    ))}
+                  {subTab === "mental-models" && (
+                    <div>
+                      <p className="text-sm text-muted-foreground mb-4">
+                        User-curated summaries generated from queries — reusable knowledge snapshots
+                        that can be refreshed as memories evolve.
+                      </p>
+                      <MentalModelsView key="mental-models" />
+                    </div>
+                  )}
                 </div>
               </div>
             )}

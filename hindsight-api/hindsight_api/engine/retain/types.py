@@ -24,6 +24,7 @@ class RetainContentDict(TypedDict, total=False):
         metadata: Custom key-value metadata (optional)
         document_id: Document ID for this content item (optional)
         entities: User-provided entities to merge with extracted entities (optional)
+        tags: Visibility scope tags for this content item (optional)
     """
 
     content: str  # Required
@@ -33,6 +34,7 @@ class RetainContentDict(TypedDict, total=False):
     document_id: str
     entities: list[dict[str, str]]  # [{"text": "...", "type": "..."}]
     content_type: ContentTypeLiteral  # "prose", "code", "diff", or "auto"
+    tags: list[str]  # Visibility scope tags
 
 
 def _now_utc() -> datetime:
@@ -54,6 +56,7 @@ class RetainContent:
     metadata: dict[str, str] = field(default_factory=dict)
     entities: list[dict[str, str]] = field(default_factory=list)  # User-provided entities
     content_type: str = "auto"  # "prose", "code", "diff", or "auto"
+    tags: list[str] = field(default_factory=list)  # Visibility scope tags
 
 
 @dataclass
@@ -88,10 +91,10 @@ class CausalRelation:
     """
     Causal relationship between facts.
 
-    Represents how one fact causes, enables, or prevents another.
+    Represents how one fact was caused by another.
     """
 
-    relation_type: str  # "causes", "enables", "prevents", "caused_by"
+    relation_type: str  # "caused_by"
     target_fact_index: int  # Index of the target fact in the batch
     strength: float = 1.0  # Strength of the causal relationship
 
@@ -136,6 +139,7 @@ class ExtractedFact:
     context: str = ""
     mentioned_at: datetime | None = None
     metadata: dict[str, str] = field(default_factory=dict)
+    tags: list[str] = field(default_factory=list)  # Visibility scope tags
 
     # Code-specific structured data (only populated for code content)
     code_structure: CodeStructure | None = None
@@ -184,6 +188,9 @@ class ProcessedFact:
     # Track which content this fact came from (for user entity merging)
     content_index: int = 0
 
+    # Visibility scope tags
+    tags: list[str] = field(default_factory=list)
+
     @property
     def is_duplicate(self) -> bool:
         """Check if this fact was marked as a duplicate."""
@@ -227,6 +234,7 @@ class ProcessedFact:
             causal_relations=extracted_fact.causal_relations,
             chunk_id=chunk_id,
             content_index=extracted_fact.content_index,
+            tags=extracted_fact.tags,
         )
 
 
@@ -258,6 +266,7 @@ class RetainBatch:
     document_id: str | None = None
     fact_type_override: str | None = None
     confidence_score: float | None = None
+    document_tags: list[str] = field(default_factory=list)  # Tags applied to all items
 
     # Extracted data (populated during processing)
     extracted_facts: list[ExtractedFact] = field(default_factory=list)

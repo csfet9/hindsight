@@ -54,7 +54,7 @@ response = client.reflect(
 client.create_bank(
     bank_id="cautious-advisor",
     name="Cautious Advisor",
-    background="I am a risk-aware financial advisor",
+    mission="I am a risk-aware financial advisor",
     disposition={
         "skepticism": 5,   # Very skeptical of claims
         "literalism": 4,   # Focuses on exact requirements
@@ -79,6 +79,41 @@ print("\nBased on:")
 for fact in response.based_on or []:
     print(f"  - [{fact.type}] {fact.text}")
 # [/docs:reflect-sources]
+
+
+# [docs:reflect-with-tags]
+# Filter reflection to only consider memories for a specific user
+response = client.reflect(
+    bank_id="my-bank",
+    query="What does this user think about our product?",
+    tags=["user:alice"],
+    tags_match="any_strict"  # Only use memories tagged for this user
+)
+# [/docs:reflect-with-tags]
+
+
+# [docs:reflect-structured-output]
+from pydantic import BaseModel
+
+# Define your response structure with Pydantic
+class HiringRecommendation(BaseModel):
+    recommendation: str
+    confidence: str  # "low", "medium", "high"
+    key_factors: list[str]
+    risks: list[str] = []
+
+response = client.reflect(
+    bank_id="hiring-team",
+    query="Should we hire Alice for the ML team lead position?",
+    response_schema=HiringRecommendation.model_json_schema(),
+)
+
+# Parse structured output into Pydantic model
+result = HiringRecommendation.model_validate(response.structured_output)
+print(f"Recommendation: {result.recommendation}")
+print(f"Confidence: {result.confidence}")
+print(f"Key factors: {result.key_factors}")
+# [/docs:reflect-structured-output]
 
 
 # =============================================================================

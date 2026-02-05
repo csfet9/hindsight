@@ -12,15 +12,30 @@ import type {
   ClearBankMemoriesData,
   ClearBankMemoriesErrors,
   ClearBankMemoriesResponses,
+  ClearObservationsData,
+  ClearObservationsErrors,
+  ClearObservationsResponses,
+  CreateDirectiveData,
+  CreateDirectiveErrors,
+  CreateDirectiveResponses,
+  CreateMentalModelData,
+  CreateMentalModelErrors,
+  CreateMentalModelResponses,
   CreateOrUpdateBankData,
   CreateOrUpdateBankErrors,
   CreateOrUpdateBankResponses,
   DeleteBankData,
   DeleteBankErrors,
   DeleteBankResponses,
+  DeleteDirectiveData,
+  DeleteDirectiveErrors,
+  DeleteDirectiveResponses,
   DeleteDocumentData,
   DeleteDocumentErrors,
   DeleteDocumentResponses,
+  DeleteMentalModelData,
+  DeleteMentalModelErrors,
+  DeleteMentalModelResponses,
   GetAgentStatsData,
   GetAgentStatsErrors,
   GetAgentStatsResponses,
@@ -30,6 +45,9 @@ import type {
   GetChunkData,
   GetChunkErrors,
   GetChunkResponses,
+  GetDirectiveData,
+  GetDirectiveErrors,
+  GetDirectiveResponses,
   GetDocumentData,
   GetDocumentErrors,
   GetDocumentResponses,
@@ -39,11 +57,25 @@ import type {
   GetGraphData,
   GetGraphErrors,
   GetGraphResponses,
+  GetMemoryData,
+  GetMemoryErrors,
+  GetMemoryResponses,
+  GetMentalModelData,
+  GetMentalModelErrors,
+  GetMentalModelResponses,
+  GetOperationStatusData,
+  GetOperationStatusErrors,
+  GetOperationStatusResponses,
+  GetVersionData,
+  GetVersionResponses,
   HealthEndpointHealthGetData,
   HealthEndpointHealthGetResponses,
   ListBanksData,
   ListBanksErrors,
   ListBanksResponses,
+  ListDirectivesData,
+  ListDirectivesErrors,
+  ListDirectivesResponses,
   ListDocumentsData,
   ListDocumentsErrors,
   ListDocumentsResponses,
@@ -53,9 +85,15 @@ import type {
   ListMemoriesData,
   ListMemoriesErrors,
   ListMemoriesResponses,
+  ListMentalModelsData,
+  ListMentalModelsErrors,
+  ListMentalModelsResponses,
   ListOperationsData,
   ListOperationsErrors,
   ListOperationsResponses,
+  ListTagsData,
+  ListTagsErrors,
+  ListTagsResponses,
   MetricsEndpointMetricsGetData,
   MetricsEndpointMetricsGetResponses,
   RecallMemoriesData,
@@ -64,15 +102,30 @@ import type {
   ReflectData,
   ReflectErrors,
   ReflectResponses,
+  RefreshMentalModelData,
+  RefreshMentalModelErrors,
+  RefreshMentalModelResponses,
   RegenerateEntityObservationsData,
   RegenerateEntityObservationsErrors,
   RegenerateEntityObservationsResponses,
   RetainMemoriesData,
   RetainMemoriesErrors,
   RetainMemoriesResponses,
+  TriggerConsolidationData,
+  TriggerConsolidationErrors,
+  TriggerConsolidationResponses,
+  UpdateBankData,
   UpdateBankDispositionData,
   UpdateBankDispositionErrors,
   UpdateBankDispositionResponses,
+  UpdateBankErrors,
+  UpdateBankResponses,
+  UpdateDirectiveData,
+  UpdateDirectiveErrors,
+  UpdateDirectiveResponses,
+  UpdateMentalModelData,
+  UpdateMentalModelErrors,
+  UpdateMentalModelResponses,
 } from "./types.gen";
 
 export type Options<
@@ -105,6 +158,19 @@ export const healthEndpointHealthGet = <ThrowOnError extends boolean = false>(
     unknown,
     ThrowOnError
   >({ url: "/health", ...options });
+
+/**
+ * Get API version and feature flags
+ *
+ * Returns API version information and enabled feature flags. Use this to check which capabilities are available in this deployment.
+ */
+export const getVersion = <ThrowOnError extends boolean = false>(
+  options?: Options<GetVersionData, ThrowOnError>,
+) =>
+  (options?.client ?? client).get<GetVersionResponses, unknown, ThrowOnError>({
+    url: "/version",
+    ...options,
+  });
 
 /**
  * Prometheus metrics endpoint
@@ -149,6 +215,20 @@ export const listMemories = <ThrowOnError extends boolean = false>(
   >({ url: "/v1/default/banks/{bank_id}/memories/list", ...options });
 
 /**
+ * Get memory unit
+ *
+ * Get a single memory unit by ID with all its metadata including entities and tags.
+ */
+export const getMemory = <ThrowOnError extends boolean = false>(
+  options: Options<GetMemoryData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    GetMemoryResponses,
+    GetMemoryErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/memories/{memory_id}", ...options });
+
+/**
  * Recall memory
  *
  * Recall memory using semantic similarity and spreading activation.
@@ -156,9 +236,6 @@ export const listMemories = <ThrowOnError extends boolean = false>(
  * The type parameter is optional and must be one of:
  * - `world`: General knowledge about people, places, events, and things that happen
  * - `experience`: Memories about experience, conversations, actions taken, and tasks performed
- * - `opinion`: The bank's formed beliefs, perspectives, and viewpoints
- *
- * Set `include_entities=true` to get entity observations alongside recall results.
  */
 export const recallMemories = <ThrowOnError extends boolean = false>(
   options: Options<RecallMemoriesData, ThrowOnError>,
@@ -186,8 +263,7 @@ export const recallMemories = <ThrowOnError extends boolean = false>(
  * 2. Retrieves world facts relevant to the query
  * 3. Retrieves existing opinions (bank's perspectives)
  * 4. Uses LLM to formulate a contextual answer
- * 5. Extracts and stores any new opinions formed
- * 6. Returns plain text answer, the facts used, and new opinions
+ * 5. Returns plain text answer and the facts used
  */
 export const reflect = <ThrowOnError extends boolean = false>(
   options: Options<ReflectData, ThrowOnError>,
@@ -236,7 +312,7 @@ export const getAgentStats = <ThrowOnError extends boolean = false>(
 /**
  * List entities
  *
- * List all entities (people, organizations, etc.) known by the bank, ordered by mention count.
+ * List all entities (people, organizations, etc.) known by the bank, ordered by mention count. Supports pagination.
  */
 export const listEntities = <ThrowOnError extends boolean = false>(
   options: Options<ListEntitiesData, ThrowOnError>,
@@ -262,9 +338,11 @@ export const getEntity = <ThrowOnError extends boolean = false>(
   >({ url: "/v1/default/banks/{bank_id}/entities/{entity_id}", ...options });
 
 /**
- * Regenerate entity observations
+ * Regenerate entity observations (deprecated)
  *
- * Regenerate observations for an entity based on all facts mentioning it.
+ * This endpoint is deprecated. Entity observations have been replaced by mental models.
+ *
+ * @deprecated
  */
 export const regenerateEntityObservations = <
   ThrowOnError extends boolean = false,
@@ -278,6 +356,203 @@ export const regenerateEntityObservations = <
   >({
     url: "/v1/default/banks/{bank_id}/entities/{entity_id}/regenerate",
     ...options,
+  });
+
+/**
+ * List mental models
+ *
+ * List user-curated living documents that stay current.
+ */
+export const listMentalModels = <ThrowOnError extends boolean = false>(
+  options: Options<ListMentalModelsData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    ListMentalModelsResponses,
+    ListMentalModelsErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/mental-models", ...options });
+
+/**
+ * Create mental model
+ *
+ * Create a mental model by running reflect with the source query in the background. Returns an operation ID to track progress. The content is auto-generated by the reflect endpoint. Use the operations endpoint to check completion status.
+ */
+export const createMentalModel = <ThrowOnError extends boolean = false>(
+  options: Options<CreateMentalModelData, ThrowOnError>,
+) =>
+  (options.client ?? client).post<
+    CreateMentalModelResponses,
+    CreateMentalModelErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/mental-models",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Delete mental model
+ *
+ * Delete a mental model.
+ */
+export const deleteMentalModel = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteMentalModelData, ThrowOnError>,
+) =>
+  (options.client ?? client).delete<
+    DeleteMentalModelResponses,
+    DeleteMentalModelErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}",
+    ...options,
+  });
+
+/**
+ * Get mental model
+ *
+ * Get a specific mental model by ID.
+ */
+export const getMentalModel = <ThrowOnError extends boolean = false>(
+  options: Options<GetMentalModelData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    GetMentalModelResponses,
+    GetMentalModelErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}",
+    ...options,
+  });
+
+/**
+ * Update mental model
+ *
+ * Update a mental model's name and/or source query.
+ */
+export const updateMentalModel = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateMentalModelData, ThrowOnError>,
+) =>
+  (options.client ?? client).patch<
+    UpdateMentalModelResponses,
+    UpdateMentalModelErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Refresh mental model
+ *
+ * Submit an async task to re-run the source query through reflect and update the content.
+ */
+export const refreshMentalModel = <ThrowOnError extends boolean = false>(
+  options: Options<RefreshMentalModelData, ThrowOnError>,
+) =>
+  (options.client ?? client).post<
+    RefreshMentalModelResponses,
+    RefreshMentalModelErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh",
+    ...options,
+  });
+
+/**
+ * List directives
+ *
+ * List hard rules that are injected into prompts.
+ */
+export const listDirectives = <ThrowOnError extends boolean = false>(
+  options: Options<ListDirectivesData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    ListDirectivesResponses,
+    ListDirectivesErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/directives", ...options });
+
+/**
+ * Create directive
+ *
+ * Create a hard rule that will be injected into prompts.
+ */
+export const createDirective = <ThrowOnError extends boolean = false>(
+  options: Options<CreateDirectiveData, ThrowOnError>,
+) =>
+  (options.client ?? client).post<
+    CreateDirectiveResponses,
+    CreateDirectiveErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/directives",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Delete directive
+ *
+ * Delete a directive.
+ */
+export const deleteDirective = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteDirectiveData, ThrowOnError>,
+) =>
+  (options.client ?? client).delete<
+    DeleteDirectiveResponses,
+    DeleteDirectiveErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/directives/{directive_id}",
+    ...options,
+  });
+
+/**
+ * Get directive
+ *
+ * Get a specific directive by ID.
+ */
+export const getDirective = <ThrowOnError extends boolean = false>(
+  options: Options<GetDirectiveData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    GetDirectiveResponses,
+    GetDirectiveErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/directives/{directive_id}",
+    ...options,
+  });
+
+/**
+ * Update directive
+ *
+ * Update a directive's properties.
+ */
+export const updateDirective = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateDirectiveData, ThrowOnError>,
+) =>
+  (options.client ?? client).patch<
+    UpdateDirectiveResponses,
+    UpdateDirectiveErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/directives/{directive_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
   });
 
 /**
@@ -330,6 +605,20 @@ export const getDocument = <ThrowOnError extends boolean = false>(
   >({ url: "/v1/default/banks/{bank_id}/documents/{document_id}", ...options });
 
 /**
+ * List tags
+ *
+ * List all unique tags in a memory bank with usage counts. Supports wildcard search using '*' (e.g., 'user:*', '*-fred', 'tag*-2'). Case-insensitive.
+ */
+export const listTags = <ThrowOnError extends boolean = false>(
+  options: Options<ListTagsData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    ListTagsResponses,
+    ListTagsErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/tags", ...options });
+
+/**
  * Get chunk details
  *
  * Get a specific chunk by its ID
@@ -346,7 +635,7 @@ export const getChunk = <ThrowOnError extends boolean = false>(
 /**
  * List async operations
  *
- * Get a list of all async operations (pending and failed) for a specific agent, including error messages for failed operations
+ * Get a list of async operations for a specific agent, with optional filtering by status. Results are sorted by most recent first.
  */
 export const listOperations = <ThrowOnError extends boolean = false>(
   options: Options<ListOperationsData, ThrowOnError>,
@@ -375,9 +664,26 @@ export const cancelOperation = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Get operation status
+ *
+ * Get the status of a specific async operation. Returns 'pending', 'completed', or 'failed'. Completed operations are removed from storage, so 'completed' means the operation finished successfully.
+ */
+export const getOperationStatus = <ThrowOnError extends boolean = false>(
+  options: Options<GetOperationStatusData, ThrowOnError>,
+) =>
+  (options.client ?? client).get<
+    GetOperationStatusResponses,
+    GetOperationStatusErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/operations/{operation_id}",
+    ...options,
+  });
+
+/**
  * Get memory bank profile
  *
- * Get disposition traits and background for a memory bank. Auto-creates agent with defaults if not exists.
+ * Get disposition traits and mission for a memory bank. Auto-creates agent with defaults if not exists.
  */
 export const getBankProfile = <ThrowOnError extends boolean = false>(
   options: Options<GetBankProfileData, ThrowOnError>,
@@ -410,9 +716,11 @@ export const updateBankDisposition = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Add/merge memory bank background
+ * Add/merge memory bank background (deprecated)
  *
- * Add new background information or merge with existing. LLM intelligently resolves conflicts, normalizes to first person, and optionally infers disposition traits.
+ * Deprecated: Use PUT /mission instead. This endpoint now updates the mission field.
+ *
+ * @deprecated
  */
 export const addBankBackground = <ThrowOnError extends boolean = false>(
   options: Options<AddBankBackgroundData, ThrowOnError>,
@@ -445,9 +753,30 @@ export const deleteBank = <ThrowOnError extends boolean = false>(
   >({ url: "/v1/default/banks/{bank_id}", ...options });
 
 /**
+ * Partial update memory bank
+ *
+ * Partially update an agent's profile. Only provided fields will be updated.
+ */
+export const updateBank = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateBankData, ThrowOnError>,
+) =>
+  (options.client ?? client).patch<
+    UpdateBankResponses,
+    UpdateBankErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * Create or update memory bank
  *
- * Create a new agent or update existing agent with disposition and background. Auto-fills missing fields with defaults.
+ * Create a new agent or update existing agent with disposition and mission. Auto-fills missing fields with defaults.
  */
 export const createOrUpdateBank = <ThrowOnError extends boolean = false>(
   options: Options<CreateOrUpdateBankData, ThrowOnError>,
@@ -464,6 +793,34 @@ export const createOrUpdateBank = <ThrowOnError extends boolean = false>(
       ...options.headers,
     },
   });
+
+/**
+ * Clear all observations
+ *
+ * Delete all observations for a memory bank. This is useful for resetting the consolidated knowledge.
+ */
+export const clearObservations = <ThrowOnError extends boolean = false>(
+  options: Options<ClearObservationsData, ThrowOnError>,
+) =>
+  (options.client ?? client).delete<
+    ClearObservationsResponses,
+    ClearObservationsErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/observations", ...options });
+
+/**
+ * Trigger consolidation
+ *
+ * Run memory consolidation to create/update observations from recent memories.
+ */
+export const triggerConsolidation = <ThrowOnError extends boolean = false>(
+  options: Options<TriggerConsolidationData, ThrowOnError>,
+) =>
+  (options.client ?? client).post<
+    TriggerConsolidationResponses,
+    TriggerConsolidationErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/consolidate", ...options });
 
 /**
  * Clear memory bank memories

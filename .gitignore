@@ -27,6 +27,10 @@ docker-compose.override.yml
 # NLTK data (will be downloaded automatically)
 nltk_data/
 
+# Monitoring stack (Prometheus/Grafana binaries and data)
+.monitoring/
+.pgbouncer/
+
 # Large benchmark datasets (will be downloaded automatically)
 **/longmemeval_s_cleaned.json
 
@@ -41,9 +45,12 @@ hindsight-docs/static/llms-full.txt
 
 hindsight-dev/benchmarks/locomo/results/
 hindsight-dev/benchmarks/longmemeval/results/
+hindsight-dev/benchmarks/consolidation/results/
+benchmarks/results/
 hindsight-cli/target
 hindsight-clients/rust/target
 .claude
 whats-next.md
 TASK.md
-CHANGELOG.md
+# Changelog is now tracked in hindsight-docs/src/pages/changelog.md
+# CHANGELOG.md

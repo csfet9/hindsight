@@ -39,18 +39,11 @@ response = client.recall(
     budget="high",
     max_tokens=8000,
     trace=True,
-    include_entities=True,
-    max_entity_tokens=500
 )
 
 # Access results
 for r in response.results:
     print(f"- {r.text}")
-
-# Access entity observations (if include_entities=True)
-if response.entities:
-    for entity_id, entity in response.entities.items():
-        print(f"Entity: {entity.canonical_name}")
 # [/docs:recall-with-options]
 
 
@@ -74,14 +67,31 @@ experience = client.recall(
 # [/docs:recall-experience-only]
 
 
-# [docs:recall-opinions-only]
-# Only opinions (formed beliefs)
-opinions = client.recall(
+# [docs:recall-observations-only]
+# Only observations (consolidated knowledge)
+observations = client.recall(
     bank_id="my-bank",
-    query="What do I think about Python?",
-    types=["opinion"]
+    query="What patterns have I learned?",
+    types=["observation"]
 )
-# [/docs:recall-opinions-only]
+# [/docs:recall-observations-only]
+
+
+# [docs:recall-with-observations]
+# Include observations in recall
+results = client.recall(
+    bank_id="my-bank",
+    query="What programming languages does Alice prefer?",
+    types=["world", "experience", "observation"]
+)
+
+# Observations only
+observations = client.recall(
+    bank_id="my-bank",
+    query="What patterns have I learned?",
+    types=["observation"]
+)
+# [/docs:recall-with-observations]
 
 
 # [docs:recall-token-budget]
@@ -93,18 +103,6 @@ results = client.recall(bank_id="my-bank", query="Alice's email", max_tokens=500
 # [/docs:recall-token-budget]
 
 
-# [docs:recall-include-entities]
-response = client.recall(
-    bank_id="my-bank",
-    query="What does Alice do?",
-    max_tokens=4096,              # Budget for memories
-    include_entities=True,
-    max_entity_tokens=1000        # Budget for entity observations
-)
-
-# Access the additional context
-entities = response.entities or []
-# [/docs:recall-include-entities]
 
 
 # [docs:recall-budget-levels]
@@ -114,6 +112,66 @@ results = client.recall(bank_id="my-bank", query="Alice's email", budget="low")
 # Deep exploration
 results = client.recall(bank_id="my-bank", query="How are Alice and Bob connected?", budget="high")
 # [/docs:recall-budget-levels]
+
+
+# [docs:recall-with-tags]
+# Filter recall to only memories tagged for a specific user
+response = client.recall(
+    bank_id="my-bank",
+    query="What feedback did the user give?",
+    tags=["user:alice"],
+    tags_match="any"  # OR matching, includes untagged (default)
+)
+# [/docs:recall-with-tags]
+
+
+# [docs:recall-tags-strict]
+# Strict mode: only return memories that have matching tags (exclude untagged)
+response = client.recall(
+    bank_id="my-bank",
+    query="What did the user say?",
+    tags=["user:alice"],
+    tags_match="any_strict"  # OR matching, excludes untagged memories
+)
+# [/docs:recall-tags-strict]
+
+
+# [docs:recall-tags-all]
+# AND matching: require ALL specified tags to be present
+response = client.recall(
+    bank_id="my-bank",
+    query="What bugs were reported?",
+    tags=["user:alice", "bug-report"],
+    tags_match="all_strict"  # Memory must have BOTH tags
+)
+# [/docs:recall-tags-all]
+
+
+# =============================================================================
+# Legacy snippets for v0.3 docs (kept for backward compatibility)
+# =============================================================================
+
+# [docs:recall-opinions-only]
+# Legacy: opinions replaced by observations in v0.4+
+# Only retrieve opinions (beliefs and preferences)
+opinions = client.recall(
+    bank_id="my-bank",
+    query="What are my preferences?",
+    types=["opinion"]
+)
+# [/docs:recall-opinions-only]
+
+
+# [docs:recall-include-entities]
+# Legacy: entity summaries replaced by observations in v0.4+
+# Include entity summaries in recall results
+response = client.recall(
+    bank_id="my-bank",
+    query="What do I know about Alice?",
+    include_entities=True,
+    max_entity_tokens=500
+)
+# [/docs:recall-include-entities]
 
 
 # =============================================================================

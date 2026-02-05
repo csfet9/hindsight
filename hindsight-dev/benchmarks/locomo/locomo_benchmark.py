@@ -16,7 +16,12 @@ import pydantic
 from hindsight_api.engine.llm_wrapper import LLMConfig
 from openai import AsyncOpenAI
 
-from benchmarks.common.benchmark_runner import BenchmarkDataset, BenchmarkRunner, LLMAnswerEvaluator, LLMAnswerGenerator
+from benchmarks.common.benchmark_runner import (
+    BenchmarkDataset,
+    BenchmarkRunner,
+    LLMAnswerEvaluator,
+    LLMAnswerGenerator,
+)
 
 
 class LoComoDataset(BenchmarkDataset):
@@ -117,6 +122,7 @@ class LoComoAnswerGenerator(LLMAnswerGenerator):
         recall_result: Dict[str, Any],
         question_date: Optional[datetime] = None,
         question_type: Optional[str] = None,
+        bank_id: Optional[str] = None,
     ) -> Tuple[str, str, Optional[List[Dict[str, Any]]]]:
         """
         Generate answer from retrieved memories using Groq.
@@ -208,6 +214,7 @@ class LoComoThinkAnswerGenerator(LLMAnswerGenerator):
         recall_result: Dict[str, Any],
         question_date: Optional[datetime] = None,
         question_type: Optional[str] = None,
+        bank_id: Optional[str] = None,
     ) -> Tuple[str, str, Optional[List[Dict[str, Any]]]]:
         """
         Generate answer using the integrated think API.
@@ -220,6 +227,7 @@ class LoComoThinkAnswerGenerator(LLMAnswerGenerator):
             recall_result: Not used (empty dict), as think does its own retrieval
             question_date: Date when the question was asked (currently not used by think API)
             question_type: Question category (unused in think API)
+            bank_id: Not used - think API uses self.agent_id from constructor
 
         Returns:
             Tuple of (answer, reasoning, retrieved_memories)
@@ -349,11 +357,16 @@ async def run_benchmark(
 
         memory = await create_memory_engine()
 
+    # Select answer generator based on mode
+    from hindsight_api.engine.memory_engine import Budget
+
     if use_think:
+        console.print("[blue]Mode: think (using think API)[/blue]")
         answer_generator = LoComoThinkAnswerGenerator(memory=memory, agent_id="locomo", thinking_budget=500)
         max_concurrent_questions = max_concurrent_questions_override or 4
         eval_semaphore_size = 4
     else:
+        console.print("[blue]Mode: recall+LLM (traditional)[/blue]")
         answer_generator = LoComoAnswerGenerator()
         # Reduced from 32 to 10 to match search semaphore limit
         # Prevents "too many connections" errors
@@ -396,6 +409,11 @@ async def run_benchmark(
     # Merge with existing results if running a specific conversation or using filters
     merge_with_existing = conversation is not None or only_failed or only_invalid
 
+    # Each conversation gets its own isolated bank
+    separate_ingestion = False
+    clear_per_item = True  # Use unique agent ID per conversation
+    concurrent_items = 3  # Process up to 3 conversations in parallel
+
     # Run benchmark with parallel conversation processing
     # Each conversation gets its own agent ID (locomo_conv-26, locomo_conv-30, etc.)
     # This allows conversations to run in parallel (up to max_concurrent_items at a time)
@@ -410,8 +428,9 @@ async def run_benchmark(
         max_concurrent_questions=max_concurrent_questions,
         eval_semaphore_size=eval_semaphore_size,
         specific_item=conversation,
-        clear_agent_per_item=True,  # Use unique agent ID per conversation
-        max_concurrent_items=3,  # Process up to 3 conversations in parallel
+        separate_ingestion_phase=separate_ingestion,
+        clear_agent_per_item=clear_per_item,
+        max_concurrent_items=concurrent_items,
         output_path=output_path,  # Save results incrementally
         merge_with_existing=merge_with_existing,
     )
@@ -421,7 +440,7 @@ async def run_benchmark(
     console.print(f"\n[green]✓[/green] Results saved incrementally to {output_path}")
 
     # Generate markdown table
-    generate_markdown_table(results, use_think)
+    generate_markdown_table(results, use_think=use_think)
 
     return results
 

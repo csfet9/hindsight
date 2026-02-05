@@ -1,4 +1,4 @@
-"""Hindsight MCP Server implementation using FastMCP."""
+"""Hindsight MCP Server implementation using FastMCP (HTTP transport)."""
 
 import json
 import logging
@@ -8,8 +8,7 @@ from contextvars import ContextVar
 from fastmcp import FastMCP
 
 from hindsight_api import MemoryEngine
-from hindsight_api.engine.response_models import VALID_RECALL_FACT_TYPES
-from hindsight_api.models import RequestContext
+from hindsight_api.mcp_tools import MCPToolsConfig, register_mcp_tools
 
 # Configure logging from HINDSIGHT_API_LOG_LEVEL environment variable
 _log_level_str = os.environ.get("HINDSIGHT_API_LOG_LEVEL", "info").lower()
@@ -30,13 +29,24 @@ logger = logging.getLogger(__name__)
 # Default bank_id from environment variable
 DEFAULT_BANK_ID = os.environ.get("HINDSIGHT_MCP_BANK_ID", "default")
 
+# MCP authentication token (optional - if set, Bearer token auth is required)
+MCP_AUTH_TOKEN = os.environ.get("HINDSIGHT_API_MCP_AUTH_TOKEN")
+
 # Context variable to hold the current bank_id
 _current_bank_id: ContextVar[str | None] = ContextVar("current_bank_id", default=None)
+
+# Context variable to hold the current API key (for tenant auth propagation)
+_current_api_key: ContextVar[str | None] = ContextVar("current_api_key", default=None)
 
 
 def get_current_bank_id() -> str | None:
     """Get the current bank_id from context."""
     return _current_bank_id.get()
+
+
+def get_current_api_key() -> str | None:
+    """Get the current API key from context."""
+    return _current_api_key.get()
 
 
 def create_mcp_server(memory: MemoryEngine) -> FastMCP:
@@ -52,146 +62,26 @@ def create_mcp_server(memory: MemoryEngine) -> FastMCP:
     # Use stateless_http=True for Claude Code compatibility
     mcp = FastMCP("hindsight-mcp-server", stateless_http=True)
 
-    @mcp.tool()
-    async def retain(
-        content: str,
-        context: str = "general",
-        async_processing: bool = True,
-        bank_id: str | None = None,
-    ) -> str:
-        """
-        Store important information to long-term memory.
+    # Configure and register tools using shared module
+    config = MCPToolsConfig(
+        bank_id_resolver=get_current_bank_id,
+        api_key_resolver=get_current_api_key,  # Propagate API key for tenant auth
+        include_bank_id_param=True,  # HTTP MCP supports multi-bank via parameter
+        tools=None,  # All tools
+        retain_fire_and_forget=False,  # HTTP MCP supports sync/async modes
+    )
 
-        Use this tool PROACTIVELY whenever the user shares:
-        - Personal facts, preferences, or interests
-        - Important events or milestones
-        - User history, experiences, or background
-        - Decisions, opinions, or stated preferences
-        - Goals, plans, or future intentions
-        - Relationships or people mentioned
-        - Work context, projects, or responsibilities
-
-        Args:
-            content: The fact/memory to store (be specific and include relevant details)
-            context: Category for the memory (e.g., 'preferences', 'work', 'hobbies', 'family'). Default: 'general'
-            async_processing: If True, queue for background processing and return immediately. If False, wait for completion. Default: True
-            bank_id: Optional bank to store in (defaults to session bank). Use for cross-bank operations.
-        """
-        try:
-            target_bank = bank_id or get_current_bank_id()
-            if target_bank is None:
-                return "Error: No bank_id configured"
-            contents = [{"content": content, "context": context}]
-            if async_processing:
-                # Queue for background processing and return immediately
-                result = await memory.submit_async_retain(
-                    bank_id=target_bank, contents=contents, request_context=RequestContext()
-                )
-                return f"Memory queued for background processing (operation_id: {result.get('operation_id', 'N/A')})"
-            else:
-                # Wait for completion
-                await memory.retain_batch_async(
-                    bank_id=target_bank,
-                    contents=contents,
-                    request_context=RequestContext(),
-                )
-                return f"Memory stored successfully in bank '{target_bank}'"
-        except Exception as e:
-            logger.error(f"Error storing memory: {e}", exc_info=True)
-            return f"Error: {str(e)}"
-
-    @mcp.tool()
-    async def recall(query: str, max_tokens: int = 4096, bank_id: str | None = None) -> str:
-        """
-        Search memories to provide personalized, context-aware responses.
-
-        Use this tool PROACTIVELY to:
-        - Check user's preferences before making suggestions
-        - Recall user's history to provide continuity
-        - Remember user's goals and context
-        - Personalize responses based on past interactions
-
-        Args:
-            query: Natural language search query (e.g., "user's food preferences", "what projects is user working on")
-            max_tokens: Maximum tokens in the response (default: 4096)
-            bank_id: Optional bank to search in (defaults to session bank). Use for cross-bank operations.
-        """
-        try:
-            target_bank = bank_id or get_current_bank_id()
-            if target_bank is None:
-                return "Error: No bank_id configured"
-            from hindsight_api.engine.memory_engine import Budget
-
-            recall_result = await memory.recall_async(
-                bank_id=target_bank,
-                query=query,
-                fact_type=list(VALID_RECALL_FACT_TYPES),
-                budget=Budget.HIGH,
-                max_tokens=max_tokens,
-                request_context=RequestContext(),
-            )
-
-            # Use model's JSON serialization
-            return recall_result.model_dump_json(indent=2)
-        except Exception as e:
-            logger.error(f"Error searching: {e}", exc_info=True)
-            return f'{{"error": "{e}", "results": []}}'
-
-    @mcp.tool()
-    async def reflect(query: str, context: str | None = None, budget: str = "low", bank_id: str | None = None) -> str:
-        """
-        Generate thoughtful analysis by synthesizing stored memories with the bank's personality.
-
-        WHEN TO USE THIS TOOL:
-        Use reflect when you need reasoned analysis, not just fact retrieval. This tool
-        thinks through the question using everything the bank knows and its personality traits.
-
-        EXAMPLES OF GOOD QUERIES:
-        - "What patterns have emerged in how I approach debugging?"
-        - "Based on my past decisions, what architectural style do I prefer?"
-        - "What might be the best approach for this problem given what you know about me?"
-        - "How should I prioritize these tasks based on my goals?"
-
-        HOW IT DIFFERS FROM RECALL:
-        - recall: Returns raw facts matching your search (fast lookup)
-        - reflect: Reasons across memories to form a synthesized answer (deeper analysis)
-
-        Use recall for "what did I say about X?" and reflect for "what should I do about X?"
-
-        Args:
-            query: The question or topic to reflect on
-            context: Optional context about why this reflection is needed
-            budget: Search budget - 'low', 'mid', or 'high' (default: 'low')
-            bank_id: Optional bank to reflect in (defaults to session bank). Use for cross-bank operations.
-        """
-        try:
-            target_bank = bank_id or get_current_bank_id()
-            if target_bank is None:
-                return "Error: No bank_id configured"
-            from hindsight_api.engine.memory_engine import Budget
-
-            # Map string budget to enum
-            budget_map = {"low": Budget.LOW, "mid": Budget.MID, "high": Budget.HIGH}
-            budget_enum = budget_map.get(budget.lower(), Budget.LOW)
-
-            reflect_result = await memory.reflect_async(
-                bank_id=target_bank,
-                query=query,
-                budget=budget_enum,
-                context=context,
-                request_context=RequestContext(),
-            )
-
-            return reflect_result.model_dump_json(indent=2)
-        except Exception as e:
-            logger.error(f"Error reflecting: {e}", exc_info=True)
-            return f'{{"error": "{e}", "text": ""}}'
+    register_mcp_tools(mcp, memory, config)
 
     return mcp
 
 
 class MCPMiddleware:
-    """ASGI middleware that extracts bank_id from header or path and sets context.
+    """ASGI middleware that handles authentication and extracts bank_id from header or path.
+
+    Authentication:
+        If HINDSIGHT_API_MCP_AUTH_TOKEN is set, all requests must include a valid
+        Authorization header with Bearer token or direct token matching the configured value.
 
     Bank ID can be provided via:
     1. X-Bank-Id header (recommended for Claude Code)
@@ -200,7 +90,7 @@ class MCPMiddleware:
 
     For Claude Code, configure with:
         claude mcp add --transport http hindsight http://localhost:8888/mcp \\
-            --header "X-Bank-Id: my-bank"
+            --header "X-Bank-Id: my-bank" --header "Authorization: Bearer <token>"
     """
 
     def __init__(self, app, memory: MemoryEngine):
@@ -223,6 +113,22 @@ class MCPMiddleware:
         if scope["type"] != "http":
             await self.mcp_app(scope, receive, send)
             return
+
+        # Extract auth token from header (for tenant auth propagation)
+        auth_header = self._get_header(scope, "Authorization")
+        auth_token: str | None = None
+        if auth_header:
+            # Support both "Bearer <token>" and direct token
+            auth_token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else auth_header.strip()
+
+        # Authenticate if MCP_AUTH_TOKEN is configured
+        if MCP_AUTH_TOKEN:
+            if not auth_token:
+                await self._send_error(send, 401, "Authorization header required")
+                return
+            if auth_token != MCP_AUTH_TOKEN:
+                await self._send_error(send, 401, "Invalid authentication token")
+                return
 
         path = scope.get("path", "")
 
@@ -258,8 +164,10 @@ class MCPMiddleware:
             bank_id = DEFAULT_BANK_ID
             logger.debug(f"Using default bank_id: {bank_id}")
 
-        # Set bank_id context
-        token = _current_bank_id.set(bank_id)
+        # Set bank_id and api_key context
+        bank_id_token = _current_bank_id.set(bank_id)
+        # Store the auth token for tenant extension to validate
+        api_key_token = _current_api_key.set(auth_token) if auth_token else None
         try:
             new_scope = scope.copy()
             new_scope["path"] = new_path
@@ -278,7 +186,9 @@ class MCPMiddleware:
 
             await self.mcp_app(new_scope, receive, send_wrapper)
         finally:
-            _current_bank_id.reset(token)
+            _current_bank_id.reset(bank_id_token)
+            if api_key_token is not None:
+                _current_api_key.reset(api_key_token)
 
     async def _send_error(self, send, status: int, message: str):
         """Send an error response."""
@@ -301,6 +211,10 @@ class MCPMiddleware:
 def create_mcp_app(memory: MemoryEngine):
     """
     Create an ASGI app that handles MCP requests.
+
+    Authentication:
+        Set HINDSIGHT_API_MCP_AUTH_TOKEN to require Bearer token authentication.
+        If not set, MCP endpoint is open (for local development).
 
     Bank ID can be provided via:
     1. X-Bank-Id header: claude mcp add --transport http hindsight http://localhost:8888/mcp --header "X-Bank-Id: my-bank"

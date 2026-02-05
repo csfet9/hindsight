@@ -412,3 +412,17 @@ describe('TestDeleteBank', () => {
         expect(memories.total).toBe(0);
     });
 });
+
+describe('TestMission', () => {
+    test('set mission', async () => {
+        const bankId = randomBankId();
+        const response = await client.setMission(
+            bankId,
+            'Be a helpful PM tracking sprint progress and team capacity'
+        );
+
+        expect(response).not.toBeNull();
+        expect(response.bank_id).toBe(bankId);
+        expect(response.mission).toBe('Be a helpful PM tracking sprint progress and team capacity');
+    });
+});

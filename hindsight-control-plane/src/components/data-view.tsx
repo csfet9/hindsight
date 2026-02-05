@@ -6,8 +6,6 @@ import { useBank } from "@/lib/bank-context";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
-  Copy,
-  Check,
   Calendar,
   ZoomIn,
   ZoomOut,
@@ -18,6 +16,11 @@ import {
   Settings2,
   Eye,
   EyeOff,
+  RefreshCw,
+  CheckCircle,
+  Clock,
+  Network,
+  List,
 } from "lucide-react";
 import {
   Table,
@@ -31,9 +34,10 @@ import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { MemoryDetailPanel } from "./memory-detail-panel";
+import { MemoryDetailModal } from "./memory-detail-modal";
 import { Graph2D, convertHindsightGraphData, GraphNode } from "./graph-2d";
 
-type FactType = "world" | "experience" | "opinion";
+type FactType = "world" | "experience" | "observation";
 type ViewMode = "graph" | "table" | "timeline";
 
 interface DataViewProps {
@@ -46,14 +50,19 @@ export function DataView({ factType }: DataViewProps) {
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
-  const [copiedId, setCopiedId] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(1);
   const [selectedGraphNode, setSelectedGraphNode] = useState<any>(null);
-  const [selectedTableMemory, setSelectedTableMemory] = useState<any>(null);
+  const [modalMemoryId, setModalMemoryId] = useState<string | null>(null);
   const itemsPerPage = 100;
 
   // Fetch limit state - how many memories to load from the API
   const [fetchLimit, setFetchLimit] = useState(1000);
+
+  // Consolidation status for mental models
+  const [consolidationStatus, setConsolidationStatus] = useState<{
+    pending_consolidation: number;
+    last_consolidated_at: string | null;
+  } | null>(null);
 
   // Graph controls state
   const [showLabels, setShowLabels] = useState(true);
@@ -86,16 +95,6 @@ export function DataView({ factType }: DataViewProps) {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [selectedGraphNode]);
 
-  const copyToClipboard = async (text: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopiedId(text);
-      setTimeout(() => setCopiedId(null), 2000);
-    } catch (err) {
-      console.error("Failed to copy:", err);
-    }
-  };
-
   const loadData = async (limit?: number) => {
     if (!currentBank) return;
 
@@ -107,6 +106,15 @@ export function DataView({ factType }: DataViewProps) {
         limit: limit ?? fetchLimit,
       });
       setData(graphData);
+
+      // Fetch consolidation status for observations
+      if (factType === "observation") {
+        const stats: any = await client.getBankStats(currentBank);
+        setConsolidationStatus({
+          pending_consolidation: stats.pending_consolidation || 0,
+          last_consolidated_at: stats.last_consolidated_at || null,
+        });
+      }
     } catch (error) {
       console.error("Error loading data:", error);
       alert(`Error loading ${factType} data: ` + (error as Error).message);
@@ -248,11 +256,9 @@ export function DataView({ factType }: DataViewProps) {
   return (
     <div>
       {loading ? (
-        <div className="flex items-center justify-center py-20">
-          <div className="text-center">
-            <div className="text-4xl mb-2">⏳</div>
-            <div className="text-sm text-muted-foreground">Loading memories...</div>
-          </div>
+        <div className="text-center py-12">
+          <RefreshCw className="w-8 h-8 mx-auto mb-3 text-muted-foreground animate-spin" />
+          <p className="text-muted-foreground">Loading memories...</p>
         </div>
       ) : data ? (
         <>
@@ -268,57 +274,90 @@ export function DataView({ factType }: DataViewProps) {
           </div>
 
           <div className="flex items-center justify-between mb-6">
-            <div className="text-sm text-muted-foreground">
-              {searchQuery ? (
-                `${filteredTableRows.length} of ${data.table_rows?.length ?? 0} loaded memories`
-              ) : data.table_rows?.length < data.total_units ? (
-                <span>
-                  Showing {data.table_rows?.length ?? 0} of {data.total_units} total memories
-                  <button
-                    onClick={() => {
-                      const newLimit = Math.min(data.total_units, fetchLimit + 1000);
-                      setFetchLimit(newLimit);
-                      loadData(newLimit);
-                    }}
-                    className="ml-2 text-primary hover:underline"
-                  >
-                    Load more
-                  </button>
-                </span>
-              ) : (
-                `${data.total_units} total memories`
+            <div className="flex items-center gap-4">
+              <div className="text-sm text-muted-foreground">
+                {searchQuery ? (
+                  `${filteredTableRows.length} of ${data.table_rows?.length ?? 0} loaded memories`
+                ) : data.table_rows?.length < data.total_units ? (
+                  <span>
+                    Showing {data.table_rows?.length ?? 0} of {data.total_units} total memories
+                    <button
+                      onClick={() => {
+                        const newLimit = Math.min(data.total_units, fetchLimit + 1000);
+                        setFetchLimit(newLimit);
+                        loadData(newLimit);
+                      }}
+                      className="ml-2 text-primary hover:underline"
+                    >
+                      Load more
+                    </button>
+                  </span>
+                ) : (
+                  `${data.total_units} total memories`
+                )}
+              </div>
+
+              {/* Consolidation status for observations */}
+              {factType === "observation" && consolidationStatus && (
+                <div
+                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${
+                    consolidationStatus.pending_consolidation === 0
+                      ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20"
+                      : "bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20"
+                  }`}
+                  title={
+                    consolidationStatus.pending_consolidation === 0
+                      ? `All memories consolidated${consolidationStatus.last_consolidated_at ? ` (last: ${new Date(consolidationStatus.last_consolidated_at).toLocaleString()})` : ""}`
+                      : `${consolidationStatus.pending_consolidation} memories pending consolidation`
+                  }
+                >
+                  {consolidationStatus.pending_consolidation === 0 ? (
+                    <>
+                      <CheckCircle className="w-3 h-3" />
+                      In Sync
+                    </>
+                  ) : (
+                    <>
+                      <Clock className="w-3 h-3" />
+                      {consolidationStatus.pending_consolidation} Pending
+                    </>
+                  )}
+                </div>
               )}
             </div>
             <div className="flex items-center gap-2 bg-muted rounded-lg p-1">
               <button
                 onClick={() => setViewMode("graph")}
-                className={`px-4 py-2 rounded-md text-sm font-medium transition-all ${
+                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all flex items-center gap-1.5 ${
                   viewMode === "graph"
                     ? "bg-background text-foreground shadow-sm"
                     : "text-muted-foreground hover:text-foreground"
                 }`}
               >
-                Graph View
+                <Network className="w-4 h-4" />
+                Graph
               </button>
               <button
                 onClick={() => setViewMode("table")}
-                className={`px-4 py-2 rounded-md text-sm font-medium transition-all ${
+                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all flex items-center gap-1.5 ${
                   viewMode === "table"
                     ? "bg-background text-foreground shadow-sm"
                     : "text-muted-foreground hover:text-foreground"
                 }`}
               >
-                Table View
+                <List className="w-4 h-4" />
+                Table
               </button>
               <button
                 onClick={() => setViewMode("timeline")}
-                className={`px-4 py-2 rounded-md text-sm font-medium transition-all ${
+                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all flex items-center gap-1.5 ${
                   viewMode === "timeline"
                     ? "bg-background text-foreground shadow-sm"
                     : "text-muted-foreground hover:text-foreground"
                 }`}
               >
-                Timeline View
+                <Calendar className="w-4 h-4" />
+                Timeline
               </button>
             </div>
           </div>
@@ -362,6 +401,7 @@ export function DataView({ factType }: DataViewProps) {
                       memory={selectedGraphNode}
                       onClose={() => setSelectedGraphNode(null)}
                       inPanel
+                      bankId={currentBank || undefined}
                     />
                   ) : (
                     /* Legend & Controls View */
@@ -569,11 +609,12 @@ export function DataView({ factType }: DataViewProps) {
                             <Table className="table-fixed">
                               <TableHeader>
                                 <TableRow className="bg-muted/50">
-                                  <TableHead className="w-[45%]">Memory</TableHead>
+                                  <TableHead className="w-[45%]">
+                                    {factType === "observation" ? "Observation" : "Memory"}
+                                  </TableHead>
                                   <TableHead className="w-[20%]">Entities</TableHead>
-                                  <TableHead className="w-[15%]">Occurred</TableHead>
-                                  <TableHead className="w-[15%]">Mentioned</TableHead>
-                                  <TableHead className="w-[5%]"></TableHead>
+                                  <TableHead className="w-[17%]">Occurred</TableHead>
+                                  <TableHead className="w-[18%]">Mentioned</TableHead>
                                 </TableRow>
                               </TableHeader>
                               <TableBody>
@@ -582,28 +623,28 @@ export function DataView({ factType }: DataViewProps) {
                                     ? new Date(row.occurred_start).toLocaleDateString("en-US", {
                                         month: "short",
                                         day: "numeric",
+                                        year: "numeric",
                                       })
                                     : null;
                                   const mentionedDisplay = row.mentioned_at
                                     ? new Date(row.mentioned_at).toLocaleDateString("en-US", {
                                         month: "short",
                                         day: "numeric",
+                                        year: "numeric",
                                       })
                                     : null;
 
                                   return (
                                     <TableRow
                                       key={row.id || idx}
-                                      onClick={() => setSelectedTableMemory(row)}
-                                      className={`cursor-pointer hover:bg-muted/50 ${
-                                        selectedTableMemory?.id === row.id ? "bg-primary/10" : ""
-                                      }`}
+                                      onClick={() => setModalMemoryId(row.id)}
+                                      className="cursor-pointer hover:bg-muted/50"
                                     >
                                       <TableCell className="py-2">
                                         <div className="line-clamp-2 text-sm leading-snug text-foreground">
                                           {row.text}
                                         </div>
-                                        {row.context && (
+                                        {row.context && factType !== "observation" && (
                                           <div className="text-xs text-muted-foreground mt-0.5 truncate">
                                             {row.context}
                                           </div>
@@ -642,24 +683,6 @@ export function DataView({ factType }: DataViewProps) {
                                         {mentionedDisplay || (
                                           <span className="text-muted-foreground">-</span>
                                         )}
-                                      </TableCell>
-                                      <TableCell className="py-2">
-                                        <Button
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            copyToClipboard(row.id);
-                                          }}
-                                          size="sm"
-                                          variant="secondary"
-                                          className="h-6 w-6 p-0"
-                                          title="Copy ID"
-                                        >
-                                          {copiedId === row.id ? (
-                                            <Check className="h-3 w-3 text-green-600" />
-                                          ) : (
-                                            <Copy className="h-3 w-3" />
-                                          )}
-                                        </Button>
                                       </TableCell>
                                     </TableRow>
                                   );
@@ -730,21 +753,16 @@ export function DataView({ factType }: DataViewProps) {
                   )}
                 </div>
               </div>
-
-              {/* Memory Detail Panel for Table View - Fixed on Right */}
-              {selectedTableMemory && (
-                <div className="fixed right-0 top-0 h-screen w-[420px] bg-card border-l-2 border-primary shadow-2xl z-50 overflow-y-auto animate-in slide-in-from-right duration-300 ease-out">
-                  <MemoryDetailPanel
-                    memory={selectedTableMemory}
-                    onClose={() => setSelectedTableMemory(null)}
-                    inPanel
-                  />
-                </div>
-              )}
             </div>
           )}
 
-          {viewMode === "timeline" && <TimelineView data={data} filteredRows={filteredTableRows} />}
+          {viewMode === "timeline" && (
+            <TimelineView
+              data={data}
+              filteredRows={filteredTableRows}
+              bankId={currentBank || undefined}
+            />
+          )}
         </>
       ) : (
         <div className="flex items-center justify-center py-20">
@@ -754,6 +772,9 @@ export function DataView({ factType }: DataViewProps) {
           </div>
         </div>
       )}
+
+      {/* Memory Detail Modal */}
+      <MemoryDetailModal memoryId={modalMemoryId} onClose={() => setModalMemoryId(null)} />
     </div>
   );
 }
@@ -761,7 +782,15 @@ export function DataView({ factType }: DataViewProps) {
 // Timeline View Component - Custom compact timeline with zoom and navigation
 type Granularity = "year" | "month" | "week" | "day";
 
-function TimelineView({ data, filteredRows }: { data: any; filteredRows: any[] }) {
+function TimelineView({
+  data,
+  filteredRows,
+  bankId,
+}: {
+  data: any;
+  filteredRows: any[];
+  bankId?: string;
+}) {
   const [selectedItem, setSelectedItem] = useState<any>(null);
   const [granularity, setGranularity] = useState<Granularity>("month");
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -1114,7 +1143,12 @@ function TimelineView({ data, filteredRows }: { data: any; filteredRows: any[] }
       {/* Detail Panel - Fixed on Right */}
       {selectedItem && (
         <div className="fixed right-0 top-0 h-screen w-[420px] bg-card border-l-2 border-primary shadow-2xl z-50 overflow-y-auto animate-in slide-in-from-right duration-300 ease-out">
-          <MemoryDetailPanel memory={selectedItem} onClose={() => setSelectedItem(null)} inPanel />
+          <MemoryDetailPanel
+            memory={selectedItem}
+            onClose={() => setSelectedItem(null)}
+            inPanel
+            bankId={bankId}
+          />
         </div>
       )}
     </div>

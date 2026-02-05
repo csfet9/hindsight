@@ -479,14 +479,18 @@ async def create_temporal_links_batch_per_fact(
 
         if links:
             insert_start = time_mod.time()
-            await conn.executemany(
-                f"""
-                INSERT INTO {fq_table("memory_links")} (from_unit_id, to_unit_id, link_type, weight, entity_id)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (from_unit_id, to_unit_id, link_type, COALESCE(entity_id, '00000000-0000-0000-0000-000000000000'::uuid)) DO NOTHING
-                """,
-                links,
-            )
+            # Batch inserts to avoid timeout on large batches
+            BATCH_SIZE = 1000
+            for batch_start in range(0, len(links), BATCH_SIZE):
+                batch = links[batch_start : batch_start + BATCH_SIZE]
+                await conn.executemany(
+                    f"""
+                    INSERT INTO {fq_table("memory_links")} (from_unit_id, to_unit_id, link_type, weight, entity_id)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (from_unit_id, to_unit_id, link_type, COALESCE(entity_id, '00000000-0000-0000-0000-000000000000'::uuid)) DO NOTHING
+                    """,
+                    batch,
+                )
             _log(log_buffer, f"      [7.4] Insert {len(links)} temporal links: {time_mod.time() - insert_start:.3f}s")
 
         return len(links)
@@ -644,14 +648,18 @@ async def create_semantic_links_batch(
 
         if all_links:
             insert_start = time_mod.time()
-            await conn.executemany(
-                f"""
-                INSERT INTO {fq_table("memory_links")} (from_unit_id, to_unit_id, link_type, weight, entity_id)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (from_unit_id, to_unit_id, link_type, COALESCE(entity_id, '00000000-0000-0000-0000-000000000000'::uuid)) DO NOTHING
-                """,
-                all_links,
-            )
+            # Batch inserts to avoid timeout on large batches
+            BATCH_SIZE = 1000
+            for batch_start in range(0, len(all_links), BATCH_SIZE):
+                batch = all_links[batch_start : batch_start + BATCH_SIZE]
+                await conn.executemany(
+                    f"""
+                    INSERT INTO {fq_table("memory_links")} (from_unit_id, to_unit_id, link_type, weight, entity_id)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (from_unit_id, to_unit_id, link_type, COALESCE(entity_id, '00000000-0000-0000-0000-000000000000'::uuid)) DO NOTHING
+                    """,
+                    batch,
+                )
             _log(
                 log_buffer, f"      [8.3] Insert {len(all_links)} semantic links: {time_mod.time() - insert_start:.3f}s"
             )
@@ -746,17 +754,14 @@ async def create_causal_links_batch(
         causal_relations_per_fact: List of causal relations for each fact.
             Each element is a list of dicts with:
             - target_fact_index: Index into unit_ids for the target fact
-            - relation_type: "causes", "caused_by", "enables", or "prevents"
+            - relation_type: "caused_by"
             - strength: Float in [0.0, 1.0] representing relationship strength
 
     Returns:
         Number of causal links created
 
-    Causal link types:
-    - "causes": This fact directly causes the target fact (forward causation)
-    - "caused_by": This fact was caused by the target fact (backward causation)
-    - "enables": This fact enables/allows the target fact (enablement)
-    - "prevents": This fact prevents/blocks the target fact (prevention)
+    Causal link type:
+    - "caused_by": This fact was caused by the target fact
     """
     if not unit_ids or not causal_relations_per_fact:
         return 0
@@ -779,8 +784,8 @@ async def create_causal_links_batch(
                 relation_type = relation["relation_type"]
                 strength = relation.get("strength", 1.0)
 
-                # Validate relation_type - must match database constraint
-                valid_types = {"causes", "caused_by", "enables", "prevents"}
+                # Validate relation_type - only "caused_by" is supported (DB constraint)
+                valid_types = {"caused_by"}
                 if relation_type not in valid_types:
                     logger.error(
                         f"Invalid relation_type '{relation_type}' (type: {type(relation_type).__name__}) "

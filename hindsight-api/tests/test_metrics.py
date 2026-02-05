@@ -64,12 +64,12 @@ class TestMetricsCollector:
     def mock_meter(self):
         """Create a mock meter for testing."""
         meter = MagicMock()
-        # Create separate mocks for each histogram (operation_duration, llm_duration)
-        histogram_mocks = [MagicMock(), MagicMock()]
+        # Create separate mocks for each histogram (operation_duration, llm_duration, http_request_duration)
+        histogram_mocks = [MagicMock(), MagicMock(), MagicMock()]
         meter.create_histogram.side_effect = histogram_mocks
         # Create separate mocks for each counter
-        # (operation_total, llm_tokens_input, llm_tokens_output, llm_calls_total)
-        counter_mocks = [MagicMock() for _ in range(4)]
+        # (operation_total, llm_tokens_input, llm_tokens_output, llm_calls_total, http_requests_total)
+        counter_mocks = [MagicMock() for _ in range(5)]
         meter.create_counter.side_effect = counter_mocks
         return meter
 
@@ -257,12 +257,12 @@ class TestLLMMetrics:
     def mock_meter(self):
         """Create a mock meter for testing."""
         meter = MagicMock()
-        # Create separate mocks for each histogram (operation_duration, llm_duration)
-        histogram_mocks = [MagicMock(), MagicMock()]
+        # Create separate mocks for each histogram (operation_duration, llm_duration, http_request_duration)
+        histogram_mocks = [MagicMock(), MagicMock(), MagicMock()]
         meter.create_histogram.side_effect = histogram_mocks
         # Create separate mocks for each counter
-        # (operation_total, llm_tokens_input, llm_tokens_output, llm_calls_total)
-        counter_mocks = [MagicMock() for _ in range(4)]
+        # (operation_total, llm_tokens_input, llm_tokens_output, llm_calls_total, http_requests_total)
+        counter_mocks = [MagicMock() for _ in range(5)]
         meter.create_counter.side_effect = counter_mocks
         return meter
 
@@ -358,7 +358,7 @@ class TestLLMMetrics:
         collector.record_llm_call(
             provider="gemini",
             model="gemini-pro",
-            scope="entity_observation",
+            scope="memory",
             duration=2.0,
             success=True,
         )
@@ -369,11 +369,11 @@ class TestLLMMetrics:
         assert call_args[0][0] == 1
         assert call_args[0][1]["provider"] == "gemini"
         assert call_args[0][1]["model"] == "gemini-pro"
-        assert call_args[0][1]["scope"] == "entity_observation"
+        assert call_args[0][1]["scope"] == "memory"
 
     def test_record_llm_call_different_scopes(self, collector):
         """Test recording LLM calls with different scopes."""
-        scopes = ["memory", "reflect", "entity_observation", "answer"]
+        scopes = ["memory", "reflect", "consolidation", "answer"]
 
         for scope in scopes:
             collector.llm_duration.record.reset_mock()

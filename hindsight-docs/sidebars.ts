@@ -29,6 +29,16 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: 'doc',
+          id: 'developer/observations',
+          label: 'Observations',
+        },
+        {
+          type: 'doc',
+          id: 'developer/multilingual',
+          label: 'Multilingual',
+        },
+        {
+          type: 'doc',
           id: 'developer/performance',
           label: 'Performance',
         },
@@ -71,13 +81,13 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: 'doc',
-          id: 'developer/api/memory-banks',
-          label: 'Memory Banks',
+          id: 'developer/api/mental-models',
+          label: 'Mental Models',
         },
         {
           type: 'doc',
-          id: 'developer/api/entities',
-          label: 'Entities',
+          id: 'developer/api/memory-banks',
+          label: 'Memory Banks',
         },
         {
           type: 'doc',
@@ -128,8 +138,8 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: 'doc',
-          id: 'developer/metrics',
-          label: 'Metrics',
+          id: 'developer/monitoring',
+          label: 'Monitoring',
         },
         {
           type: 'doc',
@@ -160,6 +170,11 @@ const sidebars: SidebarsConfig = {
           id: 'sdks/cli',
           label: 'CLI',
         },
+        {
+          type: 'doc',
+          id: 'sdks/embed',
+          label: 'Embedded Python',
+        },
       ],
     },
     {
@@ -179,6 +194,16 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: 'doc',
+          id: 'sdks/integrations/openclaw',
+          label: 'OpenClaw',
+        },
+        {
+          type: 'doc',
+          id: 'sdks/integrations/ai-sdk',
+          label: 'Vercel AI SDK',
+        },
+        {
+          type: 'doc',
           id: 'sdks/integrations/skills',
           label: 'Skills',
         },
@@ -189,58 +214,7 @@ const sidebars: SidebarsConfig = {
     {
       type: 'doc',
       id: 'cookbook/index',
-      label: 'Overview',
-    },
-    {
-      type: 'category',
-      label: 'Recipes',
-      collapsible: false,
-      items: [
-        {
-          type: 'doc',
-          id: 'cookbook/recipes/quickstart',
-          label: 'Hindsight Quickstart',
-        },
-        {
-          type: 'doc',
-          id: 'cookbook/recipes/per-user-memory',
-          label: 'Per-User Memory',
-        },
-        {
-          type: 'doc',
-          id: 'cookbook/recipes/support-agent-shared-knowledge',
-          label: 'Support Agent with Shared Knowledge',
-        },
-        {
-          type: 'doc',
-          id: 'cookbook/recipes/litellm-memory-demo',
-          label: 'Memory with LiteLLM',
-        },
-        {
-          type: 'doc',
-          id: 'cookbook/recipes/tool-learning-demo',
-          label: 'Routing Tool Learning',
-        }
-      ],
-    },
-    {
-      type: 'category',
-      label: 'Applications',
-      collapsible: false,
-      items: [
-        {
-          type: 'doc',
-          id: 'cookbook/applications/openai-fitness-coach',
-          label: 'OpenAI Agent + Hindsight Memory Integration',
-        }
-      ],
-    },
-  ],
-  changelogSidebar: [
-    {
-      type: 'doc',
-      id: 'changelog/index',
-      label: 'Changelog',
+      label: 'Cookbook',
     },
   ],
 };

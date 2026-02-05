@@ -10,8 +10,63 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-# Valid fact types for recall operations (excludes 'observation' which is internal)
-VALID_RECALL_FACT_TYPES = frozenset(["world", "experience", "opinion"])
+# Valid fact types for recall operations (excludes 'opinion' which is deprecated)
+VALID_RECALL_FACT_TYPES = frozenset(["world", "experience", "observation"])
+
+
+class LLMToolCall(BaseModel):
+    """A tool call requested by the LLM."""
+
+    id: str = Field(description="Unique identifier for this tool call")
+    name: str = Field(description="Name of the tool to call")
+    arguments: dict[str, Any] = Field(description="Arguments to pass to the tool")
+
+
+class LLMToolCallResult(BaseModel):
+    """Result from an LLM call that may include tool calls."""
+
+    content: str | None = Field(default=None, description="Text content if any")
+    tool_calls: list[LLMToolCall] = Field(default_factory=list, description="Tool calls requested by the LLM")
+    finish_reason: str | None = Field(default=None, description="Reason the LLM stopped: 'stop', 'tool_calls', etc.")
+    input_tokens: int = Field(default=0, description="Input tokens used in this call")
+    output_tokens: int = Field(default=0, description="Output tokens used in this call")
+
+
+class ToolCallTrace(BaseModel):
+    """A single tool call made during reflect."""
+
+    tool: str = Field(description="Tool name: lookup, recall, learn, expand")
+    reason: str | None = Field(default=None, description="Agent's reasoning for making this tool call")
+    input: dict = Field(description="Tool input parameters")
+    output: dict = Field(description="Tool output/result")
+    duration_ms: int = Field(description="Execution time in milliseconds")
+    iteration: int = Field(default=0, description="Iteration number (1-based) when this tool was called")
+
+
+class LLMCallTrace(BaseModel):
+    """A single LLM call made during reflect."""
+
+    scope: str = Field(description="Call scope: agent_1, agent_2, final, etc.")
+    duration_ms: int = Field(description="Execution time in milliseconds")
+
+
+class ObservationRef(BaseModel):
+    """Reference to an observation accessed during reflect."""
+
+    id: str = Field(description="Observation ID")
+    name: str = Field(description="Observation name")
+    type: str = Field(description="Observation type: entity, concept, event")
+    subtype: str = Field(description="Observation subtype: structural, emergent, learned")
+    description: str = Field(description="Brief description")
+    summary: str | None = Field(default=None, description="Full summary (when looked up in detail)")
+
+
+class DirectiveRef(BaseModel):
+    """Reference to a directive that was applied during reflect."""
+
+    id: str = Field(description="Directive mental model ID")
+    name: str = Field(description="Directive name")
+    content: str = Field(description="Directive content")
 
 
 class TokenUsage(BaseModel):
@@ -85,6 +140,7 @@ class MemoryFact(BaseModel):
                 "metadata": {"source": "slack"},
                 "chunk_id": "bank123_session_abc123_0",
                 "activation": 0.95,
+                "tags": ["user_a", "session_123"],
             }
         }
     )
@@ -102,6 +158,7 @@ class MemoryFact(BaseModel):
     chunk_id: str | None = Field(
         None, description="ID of the chunk this fact was extracted from (format: bank_id_document_id_chunk_index)"
     )
+    tags: list[str] | None = Field(None, description="Visibility scope tags associated with this fact")
 
 
 class ChunkInfo(BaseModel):
@@ -110,6 +167,28 @@ class ChunkInfo(BaseModel):
     chunk_text: str = Field(description="The raw chunk text")
     chunk_index: int = Field(description="Index of the chunk within the document")
     truncated: bool = Field(default=False, description="Whether the chunk was truncated due to token limits")
+
+
+class ObservationResult(BaseModel):
+    """An observation result from recall (consolidated knowledge synthesized from facts)."""
+
+    id: str = Field(description="Unique observation ID")
+    text: str = Field(description="The observation text")
+    proof_count: int = Field(description="Number of facts supporting this observation")
+    relevance: float = Field(default=0.0, description="Relevance score to the query")
+    tags: list[str] | None = Field(default=None, description="Tags for visibility scoping")
+    source_memory_ids: list[str] = Field(
+        default_factory=list, description="IDs of facts that contribute to this observation"
+    )
+
+
+class MentalModelResult(BaseModel):
+    """A mental model result from recall (stored reflect response)."""
+
+    id: str = Field(description="Unique mental model ID")
+    name: str = Field(description="Human-readable name")
+    content: str = Field(description="The synthesized content")
+    relevance: float = Field(default=0.0, description="Relevance score to the query")
 
 
 class RecallResult(BaseModel):
@@ -175,8 +254,15 @@ class ReflectResult(BaseModel):
                     ],
                     "experience": [],
                     "opinion": [],
+                    "mental_models": [],
+                    "directives": [
+                        {
+                            "id": "directive-123",
+                            "name": "Response Style",
+                            "rules": ["Always be concise"],
+                        }
+                    ],
                 },
-                "new_opinions": ["Machine learning has great potential in healthcare"],
                 "structured_output": {"summary": "ML in healthcare", "confidence": 0.9},
                 "usage": {"input_tokens": 1500, "output_tokens": 500, "total_tokens": 2000},
             }
@@ -184,10 +270,9 @@ class ReflectResult(BaseModel):
     )
 
     text: str = Field(description="The formulated answer text")
-    based_on: dict[str, list[MemoryFact]] = Field(
-        description="Facts used to formulate the answer, organized by type (world, experience, opinion)"
+    based_on: dict[str, Any] = Field(
+        description="Facts used to formulate the answer, organized by type (world, experience, mental_models, directives)"
     )
-    new_opinions: list[str] = Field(default_factory=list, description="List of newly formed opinions during reflection")
     structured_output: dict[str, Any] | None = Field(
         default=None,
         description="Structured output parsed according to the provided response schema. Only present when response_schema was provided.",
@@ -196,24 +281,18 @@ class ReflectResult(BaseModel):
         default=None,
         description="Token usage metrics for the LLM calls made during this reflect operation.",
     )
-
-
-class Opinion(BaseModel):
-    """
-    An opinion with confidence score.
-
-    Opinions represent the bank's formed perspectives on topics,
-    with a confidence level indicating strength of belief.
-    """
-
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {"text": "Machine learning has great potential in healthcare", "confidence": 0.85}
-        }
+    tool_trace: list[ToolCallTrace] = Field(
+        default_factory=list,
+        description="Trace of tool calls made during reflection. Only present when include.tool_calls is enabled.",
     )
-
-    text: str = Field(description="The opinion text")
-    confidence: float = Field(description="Confidence score between 0.0 and 1.0")
+    llm_trace: list[LLMCallTrace] = Field(
+        default_factory=list,
+        description="Trace of LLM calls made during reflection. Only present when include.tool_calls is enabled.",
+    )
+    directives_applied: list[DirectiveRef] = Field(
+        default_factory=list,
+        description="Directive mental models that were applied during this reflection.",
+    )
 
 
 class EntityObservation(BaseModel):
@@ -259,3 +338,32 @@ class EntityState(BaseModel):
     observations: list[EntityObservation] = Field(
         default_factory=list, description="List of observations about this entity"
     )
+
+
+class MentalModel(BaseModel):
+    """
+    A manually configured mental model for tracking specific topics/areas.
+
+    Mental models are user-defined focus areas that the agent should track
+    and maintain summaries for, unlike auto-extracted entities.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "id": "team-dynamics",
+                "name": "Team Dynamics",
+                "description": "Track how the team collaborates, communication patterns, conflicts, and resolutions",
+                "summary": "The team has strong collaboration...",
+                "summary_updated_at": "2024-01-15T10:30:00Z",
+                "created_at": "2024-01-10T08:00:00Z",
+            }
+        }
+    )
+
+    id: str = Field(description="Unique identifier (alphanumeric lowercase)")
+    name: str = Field(description="Display name for the mental model")
+    description: str = Field(description="Prompt/directions for what to track and summarize")
+    summary: str | None = Field(None, description="Generated summary based on relevant facts")
+    summary_updated_at: str | None = Field(None, description="ISO format date when summary was last updated")
+    created_at: str = Field(description="ISO format date when the mental model was created")
