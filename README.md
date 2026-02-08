@@ -59,7 +59,7 @@ docker run --rm -it --pull always -p 8888:8888 -p 9999:9999 \
 
 You can modify the LLM provider by setting `HINDSIGHT_API_LLM_PROVIDER`. Valid options are `openai`, `anthropic`, `gemini`, `groq`, `ollama`, and `lmstudio`. The documentation provides more details on [supported models](https://hindsight.vectorize.io/developer/models).
 
-API: http://localhost:8888  
+API: http://localhost:8888
 UI: http://localhost:9999
 
 Install client:
@@ -116,10 +116,16 @@ npm install @vectorize-io/hindsight-client
 ```javascript
 const { HindsightClient } = require('@vectorize-io/hindsight-client');
 
-const client = new HindsightClient({ baseUrl: 'http://localhost:8888' });
+const example = async () => {
+  const client = new HindsightClient({ baseUrl: 'http://localhost:8888' });
 
-await client.retain('my-bank', 'Alice loves hiking in Yosemite');
-await client.recall('my-bank', 'What does Alice like?');
+  await client.retain('my-bank', 'Alice loves hiking in Yosemite');
+
+  const results = await client.recall('my-bank', 'What does Alice like?');
+  console.log(results);
+}
+
+example();
 ```
 
 ---

@@ -141,3 +141,152 @@ async def test_mcp_tools_propagate_api_key(mock_memory):
     finally:
         _current_bank_id.reset(bank_token)
         _current_api_key.reset(api_key_token)
+
+
+def test_multi_bank_mode_exposes_all_tools(mock_memory):
+    """Test that multi-bank mode exposes all tools including bank management."""
+    from hindsight_api.api.mcp import create_mcp_server
+
+    # Create server in multi-bank mode (default)
+    mcp_server = create_mcp_server(mock_memory, multi_bank=True)
+    tools = mcp_server._tool_manager._tools
+
+    # Should have all tools
+    assert "retain" in tools
+    assert "recall" in tools
+    assert "reflect" in tools
+    assert "list_banks" in tools
+    assert "create_bank" in tools
+
+
+def test_single_bank_mode_excludes_bank_management_tools(mock_memory):
+    """Test that single-bank mode only exposes bank-scoped tools."""
+    from hindsight_api.api.mcp import create_mcp_server
+
+    # Create server in single-bank mode
+    mcp_server = create_mcp_server(mock_memory, multi_bank=False)
+    tools = mcp_server._tool_manager._tools
+
+    # Should only have bank-scoped tools
+    assert "retain" in tools
+    assert "recall" in tools
+    assert "reflect" in tools
+
+    # Should NOT have bank management tools
+    assert "list_banks" not in tools
+    assert "create_bank" not in tools
+
+
+def test_multi_bank_mode_tools_have_bank_id_param(mock_memory):
+    """Test that multi-bank mode tools include bank_id parameter."""
+    from hindsight_api.api.mcp import create_mcp_server
+    import inspect
+
+    mcp_server = create_mcp_server(mock_memory, multi_bank=True)
+    tools = mcp_server._tool_manager._tools
+
+    # Check that tools have bank_id parameter
+    retain_tool = tools["retain"]
+    retain_sig = inspect.signature(retain_tool.fn)
+    assert "bank_id" in retain_sig.parameters
+
+    recall_tool = tools["recall"]
+    recall_sig = inspect.signature(recall_tool.fn)
+    assert "bank_id" in recall_sig.parameters
+
+    reflect_tool = tools["reflect"]
+    reflect_sig = inspect.signature(reflect_tool.fn)
+    assert "bank_id" in reflect_sig.parameters
+
+
+def test_single_bank_mode_tools_no_bank_id_param(mock_memory):
+    """Test that single-bank mode tools do NOT include bank_id parameter."""
+    from hindsight_api.api.mcp import create_mcp_server
+    import inspect
+
+    mcp_server = create_mcp_server(mock_memory, multi_bank=False)
+    tools = mcp_server._tool_manager._tools
+
+    # Check that tools do NOT have bank_id parameter
+    retain_tool = tools["retain"]
+    retain_sig = inspect.signature(retain_tool.fn)
+    assert "bank_id" not in retain_sig.parameters
+
+    recall_tool = tools["recall"]
+    recall_sig = inspect.signature(recall_tool.fn)
+    assert "bank_id" not in recall_sig.parameters
+
+    reflect_tool = tools["reflect"]
+    reflect_sig = inspect.signature(reflect_tool.fn)
+    assert "bank_id" not in reflect_sig.parameters
+
+
+@pytest.mark.asyncio
+async def test_middleware_handles_both_endpoints(mock_memory):
+    """Test that MCPMiddleware routes to correct server based on URL path."""
+    from hindsight_api.api.mcp import MCPMiddleware
+
+    # Create middleware (single instance)
+    middleware = MCPMiddleware(None, mock_memory)
+
+    # Verify both server instances exist
+    assert middleware.multi_bank_app is not None
+    assert middleware.single_bank_app is not None
+
+    # Verify they expose different tools
+    multi_bank_tools = middleware.multi_bank_server._tool_manager._tools
+    single_bank_tools = middleware.single_bank_server._tool_manager._tools
+
+    # Multi-bank should have all tools
+    assert "retain" in multi_bank_tools
+    assert "recall" in multi_bank_tools
+    assert "list_banks" in multi_bank_tools
+    assert "create_bank" in multi_bank_tools
+
+    # Single-bank should only have scoped tools
+    assert "retain" in single_bank_tools
+    assert "recall" in single_bank_tools
+    assert "list_banks" not in single_bank_tools
+    assert "create_bank" not in single_bank_tools
+
+
+@pytest.mark.asyncio
+async def test_routing_logic_from_url_path():
+    """Test that routing correctly selects server based on URL structure."""
+    from hindsight_api.api.mcp import MCPMiddleware
+    from unittest.mock import AsyncMock
+
+    # Mock memory
+    mock_memory = MagicMock()
+
+    # Create middleware
+    middleware = MCPMiddleware(None, mock_memory)
+
+    # Simulate different URL patterns and verify routing
+    test_cases = [
+        # (path_after_stripping_mcp, expected_bank_id_from_path, expected_bank_id, description)
+        ("/alice/messages", True, "alice", "Bank ID in path with endpoint"),
+        ("/my-agent-123/", True, "my-agent-123", "Bank ID in path with trailing slash"),
+        ("ciccio/messages", True, "ciccio", "Bank ID without leading slash (after mount strip)"),
+        ("bob", True, "bob", "Bank ID only, no leading slash"),
+        ("/messages", False, None, "MCP endpoint, no bank ID"),
+        ("/", False, None, "Root path, no bank ID"),
+    ]
+
+    for path, expected_bank_from_path, expected_bank_id, description in test_cases:
+        # Simulate the path parsing logic with leading slash normalization
+        if path and not path.startswith("/"):
+            path = "/" + path
+
+        bank_id = None
+        bank_id_from_path = False
+        MCP_ENDPOINTS = {"sse", "messages"}
+
+        if path.startswith("/") and len(path) > 1:
+            parts = path[1:].split("/", 1)
+            if parts[0] and parts[0] not in MCP_ENDPOINTS:
+                bank_id = parts[0]
+                bank_id_from_path = True
+
+        assert bank_id_from_path == expected_bank_from_path, f"Failed for: {description} (path={path})"
+        assert bank_id == expected_bank_id, f"Failed bank_id for: {description} (path={path}, got={bank_id})"

@@ -148,7 +148,15 @@ def build_system_prompt_for_tools(
 
     parts = []
 
-    # Inject directives at the VERY START for maximum prominence
+    # Anti-hallucination rule at the very top
+    parts.extend(
+        [
+            "CRITICAL: You MUST ONLY use information from retrieved tool results. NEVER make up names, people, events, or entities.",
+            "",
+        ]
+    )
+
+    # Inject directives after anti-hallucination rule
     if directives:
         parts.append(build_directives_section(directives))
 
@@ -162,7 +170,7 @@ def build_system_prompt_for_tools(
     parts.extend(
         [
             "## CRITICAL RULES",
-            "- You must NEVER fabricate information that has no basis in retrieved data",
+            "- ONLY use information from tool results - no external knowledge or guessing",
             "- You SHOULD synthesize, infer, and reason from the retrieved memories",
             "- You MUST search before saying you don't have information",
             "",
@@ -300,9 +308,11 @@ def build_system_prompt_for_tools(
     parts.extend(
         [
             "",
-            "## Output Format: Plain Text Answer",
-            "Call done() with a plain text 'answer' field.",
-            "- Do NOT use markdown formatting",
+            "## Output Format: Well-Formatted Markdown Answer",
+            "Call done() with a well-formatted markdown 'answer' field.",
+            "- USE markdown formatting for structure (headers, lists, bold, italic, code blocks, tables, etc.)",
+            "- CRITICAL: Add blank lines before and after block elements (tables, code blocks, lists)",
+            "- Format for clarity and readability with proper spacing and hierarchy",
             "- NEVER include memory IDs, UUIDs, or 'Memory references' in the answer text",
             "- Put IDs ONLY in the memory_ids/mental_model_ids/observation_ids arrays, not in the answer",
         ]
@@ -474,19 +484,30 @@ def build_final_prompt(
     return "\n".join(parts)
 
 
-FINAL_SYSTEM_PROMPT = """You are a thoughtful assistant that synthesizes answers from retrieved memories.
+FINAL_SYSTEM_PROMPT = """CRITICAL: You MUST ONLY use information from retrieved tool results. NEVER make up names, people, events, or entities.
+
+You are a thoughtful assistant that synthesizes answers from retrieved memories.
 
 Your approach:
 - Reason over the retrieved memories to answer the question
 - Make reasonable inferences when the exact answer isn't explicitly stated
 - Connect related memories to form a complete picture
 - Be helpful - if you have related information, use it to give the best possible answer
+- ONLY use information from tool results - no external knowledge or guessing
 
 Only say "I don't have information" if the retrieved data is truly unrelated to the question.
-Do NOT fabricate information that has no basis in the retrieved data.
+
+FORMATTING: Use proper markdown formatting in your answer:
+- Headers (##, ###) for sections
+- Lists (bullet or numbered) for enumerations
+- Bold/italic for emphasis
+- Tables with proper syntax (ensure blank line before and after)
+- Code blocks where appropriate
+- CRITICAL: Always add blank lines before and after block elements (tables, code blocks, lists)
+- Proper spacing between sections
 
 CRITICAL: Output ONLY the final synthesized answer. Do NOT include:
 - Meta-commentary about what you're doing ("I'll search...", "Let me analyze...")
 - Explanations of your reasoning process
 - Descriptions of your approach
-Just provide the direct answer."""
+Just provide the direct answer with proper markdown formatting."""
