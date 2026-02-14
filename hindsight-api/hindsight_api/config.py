@@ -8,8 +8,9 @@ import json
 import logging
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
+from typing import Any
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -17,6 +18,103 @@ from dotenv import find_dotenv, load_dotenv
 load_dotenv(find_dotenv(usecwd=True), override=True)
 
 logger = logging.getLogger(__name__)
+
+
+class ConfigFieldAccessError(AttributeError):
+    """Raised when trying to access a bank-configurable field from global config."""
+
+    pass
+
+
+class StaticConfigProxy:
+    """
+    Proxy that wraps HindsightConfig and only allows access to static (non-configurable) fields.
+
+    Raises ConfigFieldAccessError when trying to access configurable fields that vary per-bank.
+    Forces developers to use get_resolved_config(bank_id, context) for bank-specific settings.
+    """
+
+    def __init__(self, config: "HindsightConfig"):
+        object.__setattr__(self, "_config", config)
+        object.__setattr__(self, "_configurable_fields", HindsightConfig.get_configurable_fields())
+
+    def __getattribute__(self, name: str):
+        if name.startswith("_"):
+            return object.__getattribute__(self, name)
+
+        configurable_fields = object.__getattribute__(self, "_configurable_fields")
+        if name in configurable_fields:
+            raise ConfigFieldAccessError(
+                f"Field '{name}' is bank-configurable and cannot be accessed from global config. "
+                f"Use ConfigResolver.resolve_full_config(bank_id, context) to get bank-specific config. "
+                f"This prevents accidentally using global defaults when bank-specific overrides exist."
+            )
+
+        config = object.__getattribute__(self, "_config")
+        return getattr(config, name)
+
+    def __setattr__(self, name: str, value):
+        raise AttributeError("Config is read-only. Modifications must go through ConfigResolver.")
+
+
+# Configuration field markers for hierarchical configuration
+def hierarchical(default_value):
+    """
+    Mark a config field as hierarchical (can be overridden per-tenant/bank).
+
+    Hierarchical fields can be customized at the tenant or bank level via database
+    configuration. Examples: LLM settings, retention parameters, retrieval settings.
+    """
+    return field(default=default_value, metadata={"hierarchical": True})
+
+
+def static(default_value):
+    """
+    Mark a config field as static (server-level only, cannot be overridden).
+
+    Static fields are infrastructure-level settings that affect the entire server
+    and cannot vary per tenant or bank. Examples: database URL, API port, worker settings.
+    """
+    return field(default=default_value, metadata={"hierarchical": False})
+
+
+# Configuration key normalization utilities
+def normalize_config_key(key: str) -> str:
+    """
+    Convert environment variable format to Python field name format.
+
+    Examples:
+        HINDSIGHT_API_LLM_PROVIDER -> llm_provider
+        LLM_MODEL -> llm_model
+        llm_model -> llm_model (already normalized)
+
+    Args:
+        key: Environment variable name or Python field name
+
+    Returns:
+        Normalized Python field name (lowercase snake_case)
+    """
+    if key.startswith("HINDSIGHT_API_"):
+        key = key[len("HINDSIGHT_API_") :]
+    return key.lower()
+
+
+def normalize_config_dict(config: dict[str, Any]) -> dict[str, Any]:
+    """
+    Normalize all keys in a config dict to Python field names.
+
+    Allows users to provide config overrides in either format:
+    - Python field format: {"llm_provider": "openai"}
+    - Env var format: {"HINDSIGHT_API_LLM_PROVIDER": "openai"}
+
+    Args:
+        config: Dict with env var or Python field names as keys
+
+    Returns:
+        Dict with all keys normalized to Python field names
+    """
+    return {normalize_config_key(k): v for k, v in config.items()}
+
 
 # Environment variable names
 ENV_DATABASE_URL = "HINDSIGHT_API_DATABASE_URL"
@@ -67,27 +165,48 @@ ENV_CONSOLIDATION_LLM_TIMEOUT = "HINDSIGHT_API_CONSOLIDATION_LLM_TIMEOUT"
 ENV_EMBEDDINGS_PROVIDER = "HINDSIGHT_API_EMBEDDINGS_PROVIDER"
 ENV_EMBEDDINGS_LOCAL_MODEL = "HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL"
 ENV_EMBEDDINGS_LOCAL_FORCE_CPU = "HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU"
+ENV_EMBEDDINGS_LOCAL_TRUST_REMOTE_CODE = "HINDSIGHT_API_EMBEDDINGS_LOCAL_TRUST_REMOTE_CODE"
 ENV_EMBEDDINGS_TEI_URL = "HINDSIGHT_API_EMBEDDINGS_TEI_URL"
 ENV_EMBEDDINGS_OPENAI_API_KEY = "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY"
 ENV_EMBEDDINGS_OPENAI_MODEL = "HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL"
 ENV_EMBEDDINGS_OPENAI_BASE_URL = "HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL"
 
-ENV_COHERE_API_KEY = "HINDSIGHT_API_COHERE_API_KEY"
+# Cohere configuration (separate for embeddings and reranker)
+ENV_EMBEDDINGS_COHERE_API_KEY = "HINDSIGHT_API_EMBEDDINGS_COHERE_API_KEY"
 ENV_EMBEDDINGS_COHERE_MODEL = "HINDSIGHT_API_EMBEDDINGS_COHERE_MODEL"
 ENV_EMBEDDINGS_COHERE_BASE_URL = "HINDSIGHT_API_EMBEDDINGS_COHERE_BASE_URL"
+ENV_RERANKER_COHERE_API_KEY = "HINDSIGHT_API_RERANKER_COHERE_API_KEY"
 ENV_RERANKER_COHERE_MODEL = "HINDSIGHT_API_RERANKER_COHERE_MODEL"
 ENV_RERANKER_COHERE_BASE_URL = "HINDSIGHT_API_RERANKER_COHERE_BASE_URL"
 
-# LiteLLM gateway configuration (for embeddings and reranker via LiteLLM proxy)
+# Deprecated: Legacy shared Cohere API key (for backward compatibility)
+ENV_COHERE_API_KEY = "HINDSIGHT_API_COHERE_API_KEY"
+
+# LiteLLM configuration (separate for embeddings and reranker)
+ENV_EMBEDDINGS_LITELLM_API_BASE = "HINDSIGHT_API_EMBEDDINGS_LITELLM_API_BASE"
+ENV_EMBEDDINGS_LITELLM_API_KEY = "HINDSIGHT_API_EMBEDDINGS_LITELLM_API_KEY"
+ENV_EMBEDDINGS_LITELLM_MODEL = "HINDSIGHT_API_EMBEDDINGS_LITELLM_MODEL"
+ENV_RERANKER_LITELLM_API_BASE = "HINDSIGHT_API_RERANKER_LITELLM_API_BASE"
+ENV_RERANKER_LITELLM_API_KEY = "HINDSIGHT_API_RERANKER_LITELLM_API_KEY"
+ENV_RERANKER_LITELLM_MODEL = "HINDSIGHT_API_RERANKER_LITELLM_MODEL"
+
+# LiteLLM SDK configuration (direct API access, no proxy needed)
+ENV_EMBEDDINGS_LITELLM_SDK_API_KEY = "HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_API_KEY"
+ENV_EMBEDDINGS_LITELLM_SDK_MODEL = "HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_MODEL"
+ENV_EMBEDDINGS_LITELLM_SDK_API_BASE = "HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_API_BASE"
+ENV_RERANKER_LITELLM_SDK_API_KEY = "HINDSIGHT_API_RERANKER_LITELLM_SDK_API_KEY"
+ENV_RERANKER_LITELLM_SDK_MODEL = "HINDSIGHT_API_RERANKER_LITELLM_SDK_MODEL"
+ENV_RERANKER_LITELLM_SDK_API_BASE = "HINDSIGHT_API_RERANKER_LITELLM_SDK_API_BASE"
+
+# Deprecated: Legacy shared LiteLLM config (for backward compatibility)
 ENV_LITELLM_API_BASE = "HINDSIGHT_API_LITELLM_API_BASE"
 ENV_LITELLM_API_KEY = "HINDSIGHT_API_LITELLM_API_KEY"
-ENV_EMBEDDINGS_LITELLM_MODEL = "HINDSIGHT_API_EMBEDDINGS_LITELLM_MODEL"
-ENV_RERANKER_LITELLM_MODEL = "HINDSIGHT_API_RERANKER_LITELLM_MODEL"
 
 ENV_RERANKER_PROVIDER = "HINDSIGHT_API_RERANKER_PROVIDER"
 ENV_RERANKER_LOCAL_MODEL = "HINDSIGHT_API_RERANKER_LOCAL_MODEL"
 ENV_RERANKER_LOCAL_FORCE_CPU = "HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU"
 ENV_RERANKER_LOCAL_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT"
+ENV_RERANKER_LOCAL_TRUST_REMOTE_CODE = "HINDSIGHT_API_RERANKER_LOCAL_TRUST_REMOTE_CODE"
 ENV_RERANKER_TEI_URL = "HINDSIGHT_API_RERANKER_TEI_URL"
 ENV_RERANKER_TEI_BATCH_SIZE = "HINDSIGHT_API_RERANKER_TEI_BATCH_SIZE"
 ENV_RERANKER_TEI_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_TEI_MAX_CONCURRENT"
@@ -95,12 +214,17 @@ ENV_RERANKER_MAX_CANDIDATES = "HINDSIGHT_API_RERANKER_MAX_CANDIDATES"
 ENV_RERANKER_FLASHRANK_MODEL = "HINDSIGHT_API_RERANKER_FLASHRANK_MODEL"
 ENV_RERANKER_FLASHRANK_CACHE_DIR = "HINDSIGHT_API_RERANKER_FLASHRANK_CACHE_DIR"
 
+ENV_VECTOR_EXTENSION = "HINDSIGHT_API_VECTOR_EXTENSION"
+ENV_TEXT_SEARCH_EXTENSION = "HINDSIGHT_API_TEXT_SEARCH_EXTENSION"
+
 ENV_HOST = "HINDSIGHT_API_HOST"
 ENV_PORT = "HINDSIGHT_API_PORT"
+ENV_BASE_PATH = "HINDSIGHT_API_BASE_PATH"
 ENV_LOG_LEVEL = "HINDSIGHT_API_LOG_LEVEL"
 ENV_LOG_FORMAT = "HINDSIGHT_API_LOG_FORMAT"
 ENV_WORKERS = "HINDSIGHT_API_WORKERS"
 ENV_MCP_ENABLED = "HINDSIGHT_API_MCP_ENABLED"
+ENV_ENABLE_BANK_CONFIG_API = "HINDSIGHT_API_ENABLE_BANK_CONFIG_API"
 ENV_GRAPH_RETRIEVER = "HINDSIGHT_API_GRAPH_RETRIEVER"
 ENV_MPFP_TOP_K_NEIGHBORS = "HINDSIGHT_API_MPFP_TOP_K_NEIGHBORS"
 ENV_RECALL_MAX_CONCURRENT = "HINDSIGHT_API_RECALL_MAX_CONCURRENT"
@@ -108,6 +232,13 @@ ENV_RECALL_CONNECTION_BUDGET = "HINDSIGHT_API_RECALL_CONNECTION_BUDGET"
 ENV_MCP_LOCAL_BANK_ID = "HINDSIGHT_API_MCP_LOCAL_BANK_ID"
 ENV_MCP_INSTRUCTIONS = "HINDSIGHT_API_MCP_INSTRUCTIONS"
 ENV_MENTAL_MODEL_REFRESH_CONCURRENCY = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_CONCURRENCY"
+
+# OpenTelemetry tracing configuration
+ENV_OTEL_TRACES_ENABLED = "HINDSIGHT_API_OTEL_TRACES_ENABLED"
+ENV_OTEL_EXPORTER_OTLP_ENDPOINT = "HINDSIGHT_API_OTEL_EXPORTER_OTLP_ENDPOINT"
+ENV_OTEL_EXPORTER_OTLP_HEADERS = "HINDSIGHT_API_OTEL_EXPORTER_OTLP_HEADERS"
+ENV_OTEL_SERVICE_NAME = "HINDSIGHT_API_OTEL_SERVICE_NAME"
+ENV_OTEL_DEPLOYMENT_ENVIRONMENT = "HINDSIGHT_API_OTEL_DEPLOYMENT_ENVIRONMENT"
 
 # Vertex AI configuration
 ENV_LLM_VERTEXAI_PROJECT_ID = "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID"
@@ -185,6 +316,7 @@ DEFAULT_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY = None  # Optional, uses ADC if not set
 DEFAULT_EMBEDDINGS_PROVIDER = "local"
 DEFAULT_EMBEDDINGS_LOCAL_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_EMBEDDINGS_LOCAL_FORCE_CPU = False  # Force CPU mode for local embeddings (avoids MPS/XPC issues on macOS)
+DEFAULT_EMBEDDINGS_LOCAL_TRUST_REMOTE_CODE = False  # Security: disabled by default, required for some models
 DEFAULT_EMBEDDINGS_OPENAI_MODEL = "text-embedding-3-small"
 DEFAULT_EMBEDDING_DIMENSION = 384
 
@@ -192,6 +324,9 @@ DEFAULT_RERANKER_PROVIDER = "local"
 DEFAULT_RERANKER_LOCAL_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_RERANKER_LOCAL_FORCE_CPU = False  # Force CPU mode for local reranker (avoids MPS/XPC issues on macOS)
 DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT = 4  # Limit concurrent CPU-bound reranking to prevent thrashing
+DEFAULT_RERANKER_LOCAL_TRUST_REMOTE_CODE = (
+    False  # Security: disabled by default, required for some models like jina-reranker-v2
+)
 DEFAULT_RERANKER_TEI_BATCH_SIZE = 128
 DEFAULT_RERANKER_TEI_MAX_CONCURRENT = 8
 DEFAULT_RERANKER_MAX_CANDIDATES = 300
@@ -201,17 +336,29 @@ DEFAULT_RERANKER_FLASHRANK_CACHE_DIR = None  # Use default cache directory
 DEFAULT_EMBEDDINGS_COHERE_MODEL = "embed-english-v3.0"
 DEFAULT_RERANKER_COHERE_MODEL = "rerank-english-v3.0"
 
+# Vector extension (pgvector vs vchord)
+DEFAULT_VECTOR_EXTENSION = "pgvector"  # Options: "pgvector", "vchord"
+
+# Text search extension (native PostgreSQL, vchord BM25, or Timescale pg_textsearch)
+DEFAULT_TEXT_SEARCH_EXTENSION = "native"  # Options: "native", "vchord", "pg_textsearch"
+
 # LiteLLM defaults
 DEFAULT_LITELLM_API_BASE = "http://localhost:4000"
 DEFAULT_EMBEDDINGS_LITELLM_MODEL = "text-embedding-3-small"
 DEFAULT_RERANKER_LITELLM_MODEL = "cohere/rerank-english-v3.0"
 
+# LiteLLM SDK defaults
+DEFAULT_EMBEDDINGS_LITELLM_SDK_MODEL = "cohere/embed-english-v3.0"
+DEFAULT_RERANKER_LITELLM_SDK_MODEL = "cohere/rerank-english-v3.0"
+
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8888
+DEFAULT_BASE_PATH = ""  # Empty string = root path
 DEFAULT_LOG_LEVEL = "info"
 DEFAULT_LOG_FORMAT = "text"  # Options: "text", "json"
 DEFAULT_WORKERS = 1
 DEFAULT_MCP_ENABLED = True
+DEFAULT_ENABLE_BANK_CONFIG_API = False  # Disabled by default for security
 DEFAULT_GRAPH_RETRIEVER = "link_expansion"  # Options: "link_expansion", "mpfp", "bfs"
 DEFAULT_MPFP_TOP_K_NEIGHBORS = 20  # Fan-out limit per node in MPFP graph traversal
 DEFAULT_RECALL_MAX_CONCURRENT = 32  # Max concurrent recall operations per worker
@@ -252,6 +399,11 @@ DEFAULT_WORKER_CONSOLIDATION_MAX_SLOTS = 2  # Max concurrent consolidation tasks
 
 # Reflect agent settings
 DEFAULT_REFLECT_MAX_ITERATIONS = 10  # Max tool call iterations before forcing response
+
+# OpenTelemetry tracing configuration
+DEFAULT_OTEL_TRACES_ENABLED = False  # Disabled by default for backward compatibility
+DEFAULT_OTEL_SERVICE_NAME = "hindsight-api"
+DEFAULT_OTEL_DEPLOYMENT_ENVIRONMENT = "development"
 
 # Default MCP tool descriptions (can be customized via env vars)
 DEFAULT_MCP_RETAIN_DESCRIPTION = """Store important information to long-term memory.
@@ -331,6 +483,8 @@ class HindsightConfig:
     # Database
     database_url: str
     database_schema: str
+    vector_extension: str  # "pgvector" or "vchord"
+    text_search_extension: str  # "native" or "vchord"
 
     # LLM (default, used as fallback for per-operation config)
     llm_provider: str
@@ -383,27 +537,47 @@ class HindsightConfig:
     embeddings_provider: str
     embeddings_local_model: str
     embeddings_local_force_cpu: bool
+    embeddings_local_trust_remote_code: bool
     embeddings_tei_url: str | None
     embeddings_openai_base_url: str | None
+    embeddings_cohere_api_key: str | None
+    embeddings_cohere_model: str
     embeddings_cohere_base_url: str | None
+    embeddings_litellm_api_base: str
+    embeddings_litellm_api_key: str | None
+    embeddings_litellm_model: str
+    embeddings_litellm_sdk_api_key: str | None
+    embeddings_litellm_sdk_model: str
+    embeddings_litellm_sdk_api_base: str | None
 
     # Reranker
     reranker_provider: str
     reranker_local_model: str
     reranker_local_force_cpu: bool
     reranker_local_max_concurrent: int
+    reranker_local_trust_remote_code: bool
     reranker_tei_url: str | None
     reranker_tei_batch_size: int
     reranker_tei_max_concurrent: int
     reranker_max_candidates: int
+    reranker_cohere_api_key: str | None
+    reranker_cohere_model: str
     reranker_cohere_base_url: str | None
+    reranker_litellm_api_base: str
+    reranker_litellm_api_key: str | None
+    reranker_litellm_model: str
+    reranker_litellm_sdk_api_key: str | None
+    reranker_litellm_sdk_model: str
+    reranker_litellm_sdk_api_base: str | None
 
     # Server
     host: str
     port: int
+    base_path: str
     log_level: str
     log_format: str
     mcp_enabled: bool
+    enable_bank_config_api: bool
 
     # Recall
     graph_retriever: str
@@ -449,8 +623,115 @@ class HindsightConfig:
     # Reflect agent settings
     reflect_max_iterations: int
 
+    # OpenTelemetry tracing configuration
+    otel_traces_enabled: bool
+    otel_exporter_otlp_endpoint: str | None
+    otel_exporter_otlp_headers: str | None
+    otel_service_name: str
+    otel_deployment_environment: str
+
+    # Class-level sets for configuration categorization
+
+    # CREDENTIAL_FIELDS: Never exposed via API, never configurable per-tenant/bank
+    _CREDENTIAL_FIELDS = {
+        # API Keys
+        "llm_api_key",
+        "retain_llm_api_key",
+        "reflect_llm_api_key",
+        "consolidation_llm_api_key",
+        # Base URLs (could expose infrastructure)
+        "llm_base_url",
+        "retain_llm_base_url",
+        "reflect_llm_base_url",
+        "consolidation_llm_base_url",
+        "embeddings_tei_base_url",
+        "reranker_tei_base_url",
+        "reranker_cohere_base_url",
+        # Service Account Keys
+        "llm_vertexai_service_account_key",
+    }
+
+    # CONFIGURABLE_FIELDS: Safe behavioral settings that can be customized per-tenant/bank
+    # These fields are manually tagged as safe to expose and modify.
+    # Excludes credentials, infrastructure config, provider/model selection, and performance tuning.
+    _CONFIGURABLE_FIELDS = {
+        # Retention settings (behavioral)
+        "retain_chunk_size",
+        "retain_extraction_mode",
+        "retain_custom_instructions",
+        # Consolidation settings
+        "enable_observations",
+    }
+
+    @classmethod
+    def get_configurable_fields(cls) -> set[str]:
+        """
+        Get set of field names that are configurable per-tenant/bank via API.
+
+        Configurable fields are manually tagged behavioral settings that are safe
+        to expose and modify (e.g., retain_chunk_size, custom_instructions).
+        Excludes credentials, infrastructure config, and provider/model selection.
+
+        Returns:
+            Set of configurable field names
+        """
+        return cls._CONFIGURABLE_FIELDS.copy()
+
+    @classmethod
+    def get_credential_fields(cls) -> set[str]:
+        """
+        Get set of field names that are credentials (NEVER exposed via API).
+
+        Credential fields include API keys, base URLs, and service account keys.
+        These must never be returned in API responses or accepted in updates.
+
+        Returns:
+            Set of credential field names
+        """
+        return cls._CREDENTIAL_FIELDS.copy()
+
+    @classmethod
+    def get_hierarchical_fields(cls) -> set[str]:
+        """
+        DEPRECATED: Use get_configurable_fields() instead.
+
+        Kept for backward compatibility during migration.
+        """
+        return cls.get_configurable_fields()
+
+    @classmethod
+    def get_static_fields(cls) -> set[str]:
+        """
+        Get set of field names that are static (server-level only).
+
+        Static fields are infrastructure-level settings that cannot vary
+        per tenant or bank. These include database config, API port, worker settings, etc.
+        Also includes credential fields which are never configurable.
+
+        Returns:
+            Set of static field names
+        """
+        # Get all field names from dataclass
+        all_fields = {f.name for f in fields(cls)}
+        # Static fields = all fields - configurable fields
+        return all_fields - cls._CONFIGURABLE_FIELDS
+
     def validate(self) -> None:
         """Validate configuration values and raise errors for invalid combinations."""
+        # Validate vector_extension
+        valid_extensions = ("pgvector", "vchord")
+        if self.vector_extension not in valid_extensions:
+            raise ValueError(
+                f"Invalid vector_extension: {self.vector_extension}. Must be one of: {', '.join(valid_extensions)}"
+            )
+
+        # Validate text_search_extension
+        valid_text_search = ("native", "vchord", "pg_textsearch")
+        if self.text_search_extension not in valid_text_search:
+            raise ValueError(
+                f"Invalid text_search_extension: {self.text_search_extension}. Must be one of: {', '.join(valid_text_search)}"
+            )
+
         # RETAIN_MAX_COMPLETION_TOKENS must be greater than RETAIN_CHUNK_SIZE
         # to ensure the LLM has enough output capacity to extract facts from chunks
         if self.retain_max_completion_tokens <= self.retain_chunk_size:
@@ -476,6 +757,8 @@ class HindsightConfig:
             # Database
             database_url=os.getenv(ENV_DATABASE_URL, DEFAULT_DATABASE_URL),
             database_schema=os.getenv(ENV_DATABASE_SCHEMA, DEFAULT_DATABASE_SCHEMA),
+            vector_extension=os.getenv(ENV_VECTOR_EXTENSION, DEFAULT_VECTOR_EXTENSION).lower(),
+            text_search_extension=os.getenv(ENV_TEXT_SEARCH_EXTENSION, DEFAULT_TEXT_SEARCH_EXTENSION).lower(),
             # LLM
             llm_provider=llm_provider,
             llm_api_key=os.getenv(ENV_LLM_API_KEY),
@@ -569,9 +852,27 @@ class HindsightConfig:
                 ENV_EMBEDDINGS_LOCAL_FORCE_CPU, str(DEFAULT_EMBEDDINGS_LOCAL_FORCE_CPU)
             ).lower()
             in ("true", "1"),
+            embeddings_local_trust_remote_code=os.getenv(
+                ENV_EMBEDDINGS_LOCAL_TRUST_REMOTE_CODE, str(DEFAULT_EMBEDDINGS_LOCAL_TRUST_REMOTE_CODE)
+            ).lower()
+            in ("true", "1"),
             embeddings_tei_url=os.getenv(ENV_EMBEDDINGS_TEI_URL),
             embeddings_openai_base_url=os.getenv(ENV_EMBEDDINGS_OPENAI_BASE_URL) or None,
+            # Cohere embeddings (with backward-compatible fallback to shared API key)
+            embeddings_cohere_api_key=os.getenv(ENV_EMBEDDINGS_COHERE_API_KEY) or os.getenv(ENV_COHERE_API_KEY),
+            embeddings_cohere_model=os.getenv(ENV_EMBEDDINGS_COHERE_MODEL, DEFAULT_EMBEDDINGS_COHERE_MODEL),
             embeddings_cohere_base_url=os.getenv(ENV_EMBEDDINGS_COHERE_BASE_URL) or None,
+            # LiteLLM embeddings (with backward-compatible fallback to shared config)
+            embeddings_litellm_api_base=os.getenv(ENV_EMBEDDINGS_LITELLM_API_BASE)
+            or os.getenv(ENV_LITELLM_API_BASE, DEFAULT_LITELLM_API_BASE),
+            embeddings_litellm_api_key=os.getenv(ENV_EMBEDDINGS_LITELLM_API_KEY) or os.getenv(ENV_LITELLM_API_KEY),
+            embeddings_litellm_model=os.getenv(ENV_EMBEDDINGS_LITELLM_MODEL, DEFAULT_EMBEDDINGS_LITELLM_MODEL),
+            # LiteLLM SDK embeddings (direct API access)
+            embeddings_litellm_sdk_api_key=os.getenv(ENV_EMBEDDINGS_LITELLM_SDK_API_KEY),
+            embeddings_litellm_sdk_model=os.getenv(
+                ENV_EMBEDDINGS_LITELLM_SDK_MODEL, DEFAULT_EMBEDDINGS_LITELLM_SDK_MODEL
+            ),
+            embeddings_litellm_sdk_api_base=os.getenv(ENV_EMBEDDINGS_LITELLM_SDK_API_BASE) or None,
             # Reranker
             reranker_provider=os.getenv(ENV_RERANKER_PROVIDER, DEFAULT_RERANKER_PROVIDER),
             reranker_local_model=os.getenv(ENV_RERANKER_LOCAL_MODEL, DEFAULT_RERANKER_LOCAL_MODEL),
@@ -582,19 +883,38 @@ class HindsightConfig:
             reranker_local_max_concurrent=int(
                 os.getenv(ENV_RERANKER_LOCAL_MAX_CONCURRENT, str(DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT))
             ),
+            reranker_local_trust_remote_code=os.getenv(
+                ENV_RERANKER_LOCAL_TRUST_REMOTE_CODE, str(DEFAULT_RERANKER_LOCAL_TRUST_REMOTE_CODE)
+            ).lower()
+            in ("true", "1"),
             reranker_tei_url=os.getenv(ENV_RERANKER_TEI_URL),
             reranker_tei_batch_size=int(os.getenv(ENV_RERANKER_TEI_BATCH_SIZE, str(DEFAULT_RERANKER_TEI_BATCH_SIZE))),
             reranker_tei_max_concurrent=int(
                 os.getenv(ENV_RERANKER_TEI_MAX_CONCURRENT, str(DEFAULT_RERANKER_TEI_MAX_CONCURRENT))
             ),
             reranker_max_candidates=int(os.getenv(ENV_RERANKER_MAX_CANDIDATES, str(DEFAULT_RERANKER_MAX_CANDIDATES))),
+            # Cohere reranker (with backward-compatible fallback to shared API key)
+            reranker_cohere_api_key=os.getenv(ENV_RERANKER_COHERE_API_KEY) or os.getenv(ENV_COHERE_API_KEY),
+            reranker_cohere_model=os.getenv(ENV_RERANKER_COHERE_MODEL, DEFAULT_RERANKER_COHERE_MODEL),
             reranker_cohere_base_url=os.getenv(ENV_RERANKER_COHERE_BASE_URL) or None,
+            # LiteLLM reranker (with backward-compatible fallback to shared config)
+            reranker_litellm_api_base=os.getenv(ENV_RERANKER_LITELLM_API_BASE)
+            or os.getenv(ENV_LITELLM_API_BASE, DEFAULT_LITELLM_API_BASE),
+            reranker_litellm_api_key=os.getenv(ENV_RERANKER_LITELLM_API_KEY) or os.getenv(ENV_LITELLM_API_KEY),
+            reranker_litellm_model=os.getenv(ENV_RERANKER_LITELLM_MODEL, DEFAULT_RERANKER_LITELLM_MODEL),
+            # LiteLLM SDK reranker (direct API access)
+            reranker_litellm_sdk_api_key=os.getenv(ENV_RERANKER_LITELLM_SDK_API_KEY),
+            reranker_litellm_sdk_model=os.getenv(ENV_RERANKER_LITELLM_SDK_MODEL, DEFAULT_RERANKER_LITELLM_SDK_MODEL),
+            reranker_litellm_sdk_api_base=os.getenv(ENV_RERANKER_LITELLM_SDK_API_BASE) or None,
             # Server
             host=os.getenv(ENV_HOST, DEFAULT_HOST),
             port=int(os.getenv(ENV_PORT, DEFAULT_PORT)),
+            base_path=os.getenv(ENV_BASE_PATH, DEFAULT_BASE_PATH),
             log_level=os.getenv(ENV_LOG_LEVEL, DEFAULT_LOG_LEVEL),
             log_format=os.getenv(ENV_LOG_FORMAT, DEFAULT_LOG_FORMAT).lower(),
             mcp_enabled=os.getenv(ENV_MCP_ENABLED, str(DEFAULT_MCP_ENABLED)).lower() == "true",
+            enable_bank_config_api=os.getenv(ENV_ENABLE_BANK_CONFIG_API, str(DEFAULT_ENABLE_BANK_CONFIG_API)).lower()
+            == "true",
             # Recall
             graph_retriever=os.getenv(ENV_GRAPH_RETRIEVER, DEFAULT_GRAPH_RETRIEVER),
             mpfp_top_k_neighbors=int(os.getenv(ENV_MPFP_TOP_K_NEIGHBORS, str(DEFAULT_MPFP_TOP_K_NEIGHBORS))),
@@ -648,6 +968,13 @@ class HindsightConfig:
             ),
             # Reflect agent settings
             reflect_max_iterations=int(os.getenv(ENV_REFLECT_MAX_ITERATIONS, str(DEFAULT_REFLECT_MAX_ITERATIONS))),
+            # OpenTelemetry tracing configuration
+            otel_traces_enabled=os.getenv(ENV_OTEL_TRACES_ENABLED, str(DEFAULT_OTEL_TRACES_ENABLED)).lower()
+            in ("true", "1", "yes"),
+            otel_exporter_otlp_endpoint=os.getenv(ENV_OTEL_EXPORTER_OTLP_ENDPOINT) or None,
+            otel_exporter_otlp_headers=os.getenv(ENV_OTEL_EXPORTER_OTLP_HEADERS) or None,
+            otel_service_name=os.getenv(ENV_OTEL_SERVICE_NAME, DEFAULT_OTEL_SERVICE_NAME),
+            otel_deployment_environment=os.getenv(ENV_OTEL_DEPLOYMENT_ENVIRONMENT, DEFAULT_OTEL_DEPLOYMENT_ENVIRONMENT),
         )
         config.validate()
         return config
@@ -728,8 +1055,35 @@ class HindsightConfig:
 _config_cache: HindsightConfig | None = None
 
 
-def get_config() -> HindsightConfig:
-    """Get the cached configuration, loading from environment on first call."""
+def get_config() -> StaticConfigProxy:
+    """
+    Get global configuration with ONLY static (non-configurable) fields accessible.
+
+    This returns a proxy that prevents access to bank-configurable fields
+    (like enable_observations, retain_chunk_size, etc.).
+
+    For bank-specific configuration, use:
+        config_resolver.resolve_full_config(bank_id, context)
+
+    This design prevents accidentally using global defaults when bank-specific
+    overrides exist.
+
+    Returns:
+        StaticConfigProxy that only exposes static infrastructure fields
+
+    Raises:
+        ConfigFieldAccessError: If you try to access a bank-configurable field
+    """
+    return StaticConfigProxy(_get_raw_config())
+
+
+def _get_raw_config() -> HindsightConfig:
+    """
+    Get raw config (internal use only).
+
+    INTERNAL USE ONLY. Do not use this directly in application code.
+    Use get_config() for static fields or ConfigResolver.resolve_full_config() for bank-specific config.
+    """
     global _config_cache
     if _config_cache is None:
         _config_cache = HindsightConfig.from_env()

@@ -270,6 +270,7 @@ function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
     // Dynamic bank ID options (default: enabled)
     dynamicBankId: config.dynamicBankId !== false,
     bankIdPrefix: config.bankIdPrefix,
+    excludeProviders: Array.isArray(config.excludeProviders) ? config.excludeProviders : [],
   };
 }
 
@@ -549,21 +550,50 @@ export default function (api: MoltbotPluginAPI) {
         }
         currentAgentContext = ctx;
 
+        // Check if this provider is excluded
+        if (ctx?.messageProvider && pluginConfig.excludeProviders?.includes(ctx.messageProvider)) {
+          console.log(`[Hindsight] Skipping recall for excluded provider: ${ctx.messageProvider}`);
+          return;
+        }
+
         // Derive bank ID from context
         const bankId = deriveBankId(ctx, pluginConfig);
         console.log(`[Hindsight] before_agent_start - bank: ${bankId}, channel: ${ctx?.messageProvider}/${ctx?.channelId}`);
 
         // Get the user's latest message for recall
-        let prompt = event.prompt;
+        // Prefer rawMessage (clean user text) over prompt (envelope-formatted)
+        let prompt = event.rawMessage ?? event.prompt;
         if (!prompt || typeof prompt !== 'string' || prompt.length < 5) {
           return; // Skip very short messages
         }
 
-        // Extract actual message from Telegram format: [Telegram ... GMT+1] actual message
-        const telegramMatch = prompt.match(/\[Telegram[^\]]+\]\s*(.+)$/);
-        if (telegramMatch) {
-          prompt = telegramMatch[1].trim();
+        // Strip envelope-formatted prompts from any channel
+        // The prompt may contain: System: lines, abort hints, [Channel ...] header, [from: ...] suffix
+        let cleaned = prompt;
+
+        // Remove leading "System: ..." lines (from prependSystemEvents)
+        cleaned = cleaned.replace(/^(?:System:.*\n)+\n?/, '');
+
+        // Remove session abort hint
+        cleaned = cleaned.replace(
+          /^Note: The previous agent run was aborted[^\n]*\n\n/,
+          '',
+        );
+
+        // Extract message after [ChannelName ...] envelope header
+        // Handles any channel: Telegram, Slack, Discord, WhatsApp, Signal, etc.
+        // Uses [\s\S]+ instead of .+ to support multiline messages
+        const envelopeMatch = cleaned.match(
+          /\[[A-Z][A-Za-z]*(?:\s[^\]]+)?\]\s*([\s\S]+)$/,
+        );
+        if (envelopeMatch) {
+          cleaned = envelopeMatch[1];
         }
+
+        // Remove trailing [from: SenderName] metadata (group chats)
+        cleaned = cleaned.replace(/\n\[from:[^\]]*\]\s*$/, '');
+
+        prompt = cleaned.trim() || prompt;
 
         if (prompt.length < 5) {
           return; // Skip very short messages after extraction
@@ -587,10 +617,10 @@ export default function (api: MoltbotPluginAPI) {
 
         console.log(`[Hindsight] Auto-recall for bank ${bankId}, prompt: ${prompt.substring(0, 50)}`);
 
-        // Recall relevant memories (up to 512 tokens)
+        // Recall relevant memories
         const response = await client.recall({
           query: prompt,
-          max_tokens: 512,
+          max_tokens: 2048,
         });
 
         if (!response.results || response.results.length === 0) {
@@ -623,6 +653,12 @@ User message: ${prompt}
       try {
         // Use context from this hook, or fall back to context captured in before_agent_start
         const effectiveCtx = ctx || currentAgentContext;
+
+        // Check if this provider is excluded
+        if (effectiveCtx?.messageProvider && pluginConfig.excludeProviders?.includes(effectiveCtx.messageProvider)) {
+          console.log(`[Hindsight] Skipping retain for excluded provider: ${effectiveCtx.messageProvider}`);
+          return;
+        }
 
         // Derive bank ID from context
         const bankId = deriveBankId(effectiveCtx, pluginConfig);
@@ -666,6 +702,12 @@ User message: ${prompt}
                 .join('\n');
             }
 
+            // Strip plugin-injected memory tags to prevent feedback loop
+            // Remove <hindsight_memories> blocks injected during before_agent_start
+            content = content.replace(/<hindsight_memories>[\s\S]*?<\/hindsight_memories>/g, '');
+            // Remove any <relevant_memories> blocks (legacy/alternative format)
+            content = content.replace(/<relevant_memories>[\s\S]*?<\/relevant_memories>/g, '');
+
             return `[role: ${role}]\n${content}\n[${role}:end]`;
           })
           .join('\n\n');
@@ -675,8 +717,9 @@ User message: ${prompt}
           return;
         }
 
-        // Use session key as document ID (prefer context over captured value)
-        const documentId = effectiveCtx?.sessionKey || currentSessionKey || 'default-session';
+        // Use unique document ID per conversation (sessionKey + timestamp)
+        // Static sessionKey (e.g. "agent:main:main") causes CASCADE delete of old memories
+        const documentId = `${effectiveCtx?.sessionKey || currentSessionKey || 'session'}-${Date.now()}`;
 
         // Retain to Hindsight
         await client.retain({

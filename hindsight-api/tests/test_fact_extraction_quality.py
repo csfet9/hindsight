@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 import pytest
 
 from hindsight_api import LLMConfig
+from hindsight_api.config import _get_raw_config
 from hindsight_api.engine.retain.fact_extraction import extract_facts_from_text
 
 # =============================================================================
@@ -48,7 +49,8 @@ Marcus felt anxious about the upcoming interview.
             event_date=datetime(2024, 11, 13),
             context=context,
             llm_config=llm_config,
-            agent_name="TestUser"
+            agent_name="TestUser",
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -80,7 +82,8 @@ The music was so loud I could barely hear myself think.
             event_date=datetime(2024, 11, 13),
             context=context,
             llm_config=llm_config,
-            agent_name="TestUser"
+            agent_name="TestUser",
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -113,7 +116,8 @@ Maybe we should reconsider the timeline.
             event_date=datetime(2024, 11, 13),
             context=context,
             llm_config=llm_config,
-            agent_name="TestUser"
+            agent_name="TestUser",
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -159,7 +163,8 @@ I'm unable to attend the conference due to scheduling conflicts.
             event_date=datetime(2024, 11, 13),
             context=context,
             llm_config=llm_config,
-            agent_name="TestUser"
+            agent_name="TestUser",
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -204,7 +209,8 @@ Unlike last year, we're ahead of schedule.
             event_date=datetime(2024, 11, 13),
             context=context,
             llm_config=llm_config,
-            agent_name="TestUser"
+            agent_name="TestUser",
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -237,7 +243,8 @@ She's enthusiastic about the opportunity.
             event_date=datetime(2024, 11, 13),
             context=context,
             llm_config=llm_config,
-            agent_name="TestUser"
+            agent_name="TestUser",
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -270,7 +277,8 @@ I'm planning to switch careers because I'm not fulfilled in my current role.
             event_date=datetime(2024, 11, 13),
             context=context,
             llm_config=llm_config,
-            agent_name="TestUser"
+            agent_name="TestUser",
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -307,7 +315,8 @@ Family is the most important thing to her.
             event_date=datetime(2024, 11, 13),
             context=context,
             llm_config=llm_config,
-            agent_name="TestUser"
+            agent_name="TestUser",
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -341,7 +350,8 @@ I prefer presenting in person rather than virtually because I can read the room 
             event_date=event_date,
             context=context,
             llm_config=llm_config,
-            agent_name="TestUser"
+            agent_name="TestUser",
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -398,7 +408,8 @@ I'm planning to visit Tokyo next month.
             event_date=event_date,
             context=context,
             llm_config=llm_config,
-            agent_name="TestUser"
+            agent_name="TestUser",
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -449,7 +460,8 @@ with a concert surrounded by music, joy and the warm summer breeze.
                     event_date=event_date,
                     context=context,
                     llm_config=llm_config,
-                    agent_name="Melanie"
+                    agent_name="Melanie",
+                    config=_get_raw_config(),
                 )
 
                 assert len(facts) > 0, "Should extract at least one fact"
@@ -519,7 +531,8 @@ It was a beautiful day and I plan to make this a regular habit.
             event_date=event_date,
             context=context,
             llm_config=llm_config,
-            agent_name="TestUser"
+            agent_name="TestUser",
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -573,7 +586,8 @@ It was a beautiful day and I plan to make this a regular habit.
             event_date=reference_date,
             llm_config=llm_config,
             agent_name="TestUser",
-            context="Personal diary"
+            context="Personal diary",
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -603,7 +617,8 @@ It was a beautiful day and I plan to make this a regular habit.
             event_date=reference_date,
             llm_config=llm_config,
             agent_name="TestUser",
-            context="General info"
+            context="General info",
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -630,7 +645,8 @@ It was a beautiful day and I plan to make this a regular habit.
             event_date=reference_date,
             llm_config=llm_config,
             agent_name="TestUser",
-            context="Calendar events"
+            context="Calendar events",
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -681,7 +697,8 @@ great time! Every time I see it, I can't help but smile.
             event_date=event_date,
             context=context,
             llm_config=llm_config,
-            agent_name="Deborah"
+            agent_name="Deborah",
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -731,7 +748,8 @@ I've learned so much from it.
             event_date=datetime(2024, 11, 13),
             context=context,
             llm_config=llm_config,
-            agent_name="TestUser"
+            agent_name="TestUser",
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -800,7 +818,8 @@ Jamie: Congratulations! I'd love to read it.
             event_date=datetime(2024, 11, 13),
             llm_config=llm_config,
             agent_name="Marcus",
-            context=context
+            context=context,
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact from the transcript"
@@ -845,7 +864,8 @@ We presented our findings to the team yesterday.
             event_date=datetime(2024, 11, 13),
             llm_config=llm_config,
             agent_name="TestUser",
-            context=context
+            context=context,
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract facts"
@@ -880,7 +900,8 @@ Jamie: [teasing] We'll see who's right, my Niners pick is solid.
             event_date=datetime(2024, 11, 14),
             context=context,
             llm_config=llm_config,
-            agent_name=agent_name
+            agent_name=agent_name,
+            config=_get_raw_config(),
         )
 
         assert len(facts) > 0, "Should extract at least one fact"
@@ -946,7 +967,8 @@ so the algorithm learns to box out. See you next week!
                     event_date=datetime(2024, 11, 13),
                     llm_config=llm_config,
                     agent_name="Marcus",
-                    context=context
+                    context=context,
+                    config=_get_raw_config(),
                 )
 
                 assert len(facts) > 0, "Should extract at least one fact"

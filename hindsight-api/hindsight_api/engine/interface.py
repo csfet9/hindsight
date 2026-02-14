@@ -574,4 +574,3 @@ class MemoryEngineInterface(ABC):
             Dict with operation_id and items_count.
         """
         ...
-

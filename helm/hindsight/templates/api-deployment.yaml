@@ -33,7 +33,7 @@ spec:
       - name: api
         securityContext:
           {{- toYaml .Values.securityContext | nindent 10 }}
-        image: "{{ .Values.api.image.repository }}:{{ .Values.api.image.tag | default .Values.version }}"
+        image: "{{ .Values.api.image.repository }}:{{ .Values.api.image.tag | default .Values.version | default .Chart.AppVersion }}"
         imagePullPolicy: {{ .Values.api.image.pullPolicy }}
         ports:
         - name: http
@@ -60,9 +60,24 @@ spec:
         - name: HINDSIGHT_API_WORKER_ENABLED
           value: "false"
         {{- end }}
+        {{- /* Explicitly set port to override K8s service discovery env var (HINDSIGHT_API_PORT) */}}
+        - name: HINDSIGHT_API_PORT
+          value: {{ .Values.api.service.targetPort | quote }}
         {{- range $key, $value := .Values.api.env }}
         - name: {{ $key }}
           value: {{ $value | quote }}
+        {{- end }}
+        {{- if .Values.tei.reranker.enabled }}
+        - name: HINDSIGHT_API_RERANKER_PROVIDER
+          value: "tei"
+        - name: HINDSIGHT_API_RERANKER_TEI_URL
+          value: "http://{{ include "hindsight.fullname" . }}-tei-reranker:{{ .Values.tei.reranker.port }}"
+        {{- end }}
+        {{- if .Values.tei.embedding.enabled }}
+        - name: HINDSIGHT_API_EMBEDDINGS_PROVIDER
+          value: "tei"
+        - name: HINDSIGHT_API_EMBEDDINGS_TEI_URL
+          value: "http://{{ include "hindsight.fullname" . }}-tei-embedding:{{ .Values.tei.embedding.port }}"
         {{- end }}
         {{- /* Only use api.secrets when not using existingSecret (for chart-managed secrets) */}}
         {{- if not .Values.existingSecret }}
@@ -84,7 +99,7 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- with (.Values.api.affinity | default .Values.affinity) }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}

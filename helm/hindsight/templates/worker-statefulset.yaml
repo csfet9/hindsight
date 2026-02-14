@@ -32,7 +32,7 @@ spec:
       - name: worker
         securityContext:
           {{- toYaml .Values.securityContext | nindent 10 }}
-        image: "{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag | default .Values.version }}"
+        image: "{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag | default .Values.version | default .Chart.AppVersion }}"
         imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
         command: ["hindsight-worker"]
         ports:
@@ -99,7 +99,7 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- with (.Values.worker.affinity | default .Values.affinity) }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}

@@ -23,7 +23,7 @@ import uvicorn
 from . import MemoryEngine, __version__
 from .api import create_app
 from .banner import print_banner
-from .config import DEFAULT_WORKERS, ENV_WORKERS, HindsightConfig, get_config
+from .config import DEFAULT_WORKERS, ENV_WORKERS, HindsightConfig, _get_raw_config
 from .daemon import (
     DEFAULT_DAEMON_PORT,
     DEFAULT_IDLE_TIMEOUT,
@@ -68,7 +68,7 @@ def main():
     global _memory
 
     # Load configuration from environment (for CLI args defaults)
-    config = get_config()
+    config = _get_raw_config()
 
     parser = argparse.ArgumentParser(
         prog="hindsight-api",
@@ -155,6 +155,8 @@ def main():
         config = HindsightConfig(
             database_url=config.database_url,
             database_schema=config.database_schema,
+            vector_extension=config.vector_extension,
+            text_search_extension=config.text_search_extension,
             llm_provider=config.llm_provider,
             llm_api_key=config.llm_api_key,
             llm_model=config.llm_model,
@@ -197,23 +199,43 @@ def main():
             embeddings_provider=config.embeddings_provider,
             embeddings_local_model=config.embeddings_local_model,
             embeddings_local_force_cpu=config.embeddings_local_force_cpu,
+            embeddings_local_trust_remote_code=config.embeddings_local_trust_remote_code,
             embeddings_tei_url=config.embeddings_tei_url,
             embeddings_openai_base_url=config.embeddings_openai_base_url,
+            embeddings_cohere_api_key=config.embeddings_cohere_api_key,
+            embeddings_cohere_model=config.embeddings_cohere_model,
             embeddings_cohere_base_url=config.embeddings_cohere_base_url,
+            embeddings_litellm_api_base=config.embeddings_litellm_api_base,
+            embeddings_litellm_api_key=config.embeddings_litellm_api_key,
+            embeddings_litellm_model=config.embeddings_litellm_model,
+            embeddings_litellm_sdk_api_key=config.embeddings_litellm_sdk_api_key,
+            embeddings_litellm_sdk_model=config.embeddings_litellm_sdk_model,
+            embeddings_litellm_sdk_api_base=config.embeddings_litellm_sdk_api_base,
             reranker_provider=config.reranker_provider,
             reranker_local_model=config.reranker_local_model,
             reranker_local_force_cpu=config.reranker_local_force_cpu,
             reranker_local_max_concurrent=config.reranker_local_max_concurrent,
+            reranker_local_trust_remote_code=config.reranker_local_trust_remote_code,
             reranker_tei_url=config.reranker_tei_url,
             reranker_tei_batch_size=config.reranker_tei_batch_size,
             reranker_tei_max_concurrent=config.reranker_tei_max_concurrent,
             reranker_max_candidates=config.reranker_max_candidates,
+            reranker_cohere_api_key=config.reranker_cohere_api_key,
+            reranker_cohere_model=config.reranker_cohere_model,
             reranker_cohere_base_url=config.reranker_cohere_base_url,
+            reranker_litellm_api_base=config.reranker_litellm_api_base,
+            reranker_litellm_api_key=config.reranker_litellm_api_key,
+            reranker_litellm_model=config.reranker_litellm_model,
+            reranker_litellm_sdk_api_key=config.reranker_litellm_sdk_api_key,
+            reranker_litellm_sdk_model=config.reranker_litellm_sdk_model,
+            reranker_litellm_sdk_api_base=config.reranker_litellm_sdk_api_base,
             host=args.host,
             port=args.port,
+            base_path=config.base_path,
             log_level=args.log_level,
             log_format=config.log_format,
             mcp_enabled=config.mcp_enabled,
+            enable_bank_config_api=config.enable_bank_config_api,
             graph_retriever=config.graph_retriever,
             mpfp_top_k_neighbors=config.mpfp_top_k_neighbors,
             recall_max_concurrent=config.recall_max_concurrent,
@@ -242,6 +264,11 @@ def main():
             worker_consolidation_max_slots=config.worker_consolidation_max_slots,
             reflect_max_iterations=config.reflect_max_iterations,
             mental_model_refresh_concurrency=config.mental_model_refresh_concurrency,
+            otel_traces_enabled=config.otel_traces_enabled,
+            otel_exporter_otlp_endpoint=config.otel_exporter_otlp_endpoint,
+            otel_exporter_otlp_headers=config.otel_exporter_otlp_headers,
+            otel_service_name=config.otel_service_name,
+            otel_deployment_environment=config.otel_deployment_environment,
         )
     config.configure_logging()
     if not args.daemon:

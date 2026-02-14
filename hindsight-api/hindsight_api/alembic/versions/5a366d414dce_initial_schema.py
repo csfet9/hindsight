@@ -6,6 +6,7 @@ Create Date: 2025-11-27 11:54:19.228030
 
 """
 
+import os
 from collections.abc import Sequence
 
 import sqlalchemy as sa
@@ -19,6 +20,73 @@ revision: str = "5a366d414dce"
 down_revision: str | Sequence[str] | None = None
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
+
+
+def _detect_vector_extension() -> str:
+    """
+    Detect or validate vector extension: 'vchord' or 'pgvector'.
+    Respects HINDSIGHT_API_VECTOR_EXTENSION env var if set.
+    """
+    conn = op.get_bind()
+    vector_extension = os.getenv("HINDSIGHT_API_VECTOR_EXTENSION", "pgvector").lower()
+
+    # Validate configured extension is installed
+    if vector_extension == "vchord":
+        vchord_check = conn.execute(text("SELECT 1 FROM pg_extension WHERE extname = 'vchord'")).scalar()
+        if not vchord_check:
+            raise RuntimeError(
+                "Configured vector extension 'vchord' not found. Install it with: CREATE EXTENSION vchord CASCADE;"
+            )
+        return "vchord"
+    elif vector_extension == "pgvector":
+        pgvector_check = conn.execute(text("SELECT 1 FROM pg_extension WHERE extname = 'vector'")).scalar()
+        if not pgvector_check:
+            raise RuntimeError(
+                "Configured vector extension 'pgvector' not found. Install it with: CREATE EXTENSION vector;"
+            )
+        return "pgvector"
+    else:
+        raise ValueError(f"Invalid HINDSIGHT_API_VECTOR_EXTENSION: {vector_extension}. Must be 'pgvector' or 'vchord'")
+
+
+def _detect_text_search_extension() -> str:
+    """
+    Detect or validate text search extension: 'native', 'vchord', or 'pg_textsearch'.
+    Respects HINDSIGHT_API_TEXT_SEARCH_EXTENSION env var.
+    Creates the extension if needed.
+    """
+    text_search_extension = os.getenv("HINDSIGHT_API_TEXT_SEARCH_EXTENSION", "native").lower()
+
+    if text_search_extension == "vchord":
+        # Create vchord_bm25 extension if not exists
+        try:
+            op.execute("CREATE EXTENSION IF NOT EXISTS vchord_bm25 CASCADE")
+        except Exception:
+            # Extension might already exist or user lacks permissions - verify it exists
+            conn = op.get_bind()
+            result = conn.execute(text("SELECT 1 FROM pg_extension WHERE extname = 'vchord_bm25'")).fetchone()
+            if not result:
+                # Extension truly doesn't exist - re-raise the error
+                raise
+        return "vchord"
+    elif text_search_extension == "pg_textsearch":
+        # Create pg_textsearch extension if not exists
+        try:
+            op.execute("CREATE EXTENSION IF NOT EXISTS pg_textsearch CASCADE")
+        except Exception:
+            # Extension might already exist or user lacks permissions - verify it exists
+            conn = op.get_bind()
+            result = conn.execute(text("SELECT 1 FROM pg_extension WHERE extname = 'pg_textsearch'")).fetchone()
+            if not result:
+                # Extension truly doesn't exist - re-raise the error
+                raise
+        return "pg_textsearch"
+    elif text_search_extension == "native":
+        return "native"
+    else:
+        raise ValueError(
+            f"Invalid HINDSIGHT_API_TEXT_SEARCH_EXTENSION: {text_search_extension}. Must be 'native', 'vchord', or 'pg_textsearch'"
+        )
 
 
 def upgrade() -> None:
@@ -166,11 +234,29 @@ def upgrade() -> None:
     )
 
     # Add search_vector column for full-text search
-    op.execute("""
-        ALTER TABLE memory_units
-        ADD COLUMN search_vector tsvector
-        GENERATED ALWAYS AS (to_tsvector('english', COALESCE(text, '') || ' ' || COALESCE(context, ''))) STORED
-    """)
+    # Type depends on configured text search backend
+    text_search_ext = _detect_text_search_extension()
+
+    if text_search_ext == "vchord":
+        # VectorChord BM25: bm25vector type (no GENERATED - tokenization happens on INSERT)
+        # Note: vchord_bm25 extension creates types in bm25_catalog schema
+        op.execute("""
+            ALTER TABLE memory_units
+            ADD COLUMN search_vector bm25_catalog.bm25vector
+        """)
+    elif text_search_ext == "pg_textsearch":
+        # Timescale pg_textsearch: dummy TEXT column for consistency (indexes operate on base columns directly)
+        op.execute("""
+            ALTER TABLE memory_units
+            ADD COLUMN search_vector TEXT
+        """)
+    else:  # native
+        # Native PostgreSQL: tsvector with automatic generation
+        op.execute("""
+            ALTER TABLE memory_units
+            ADD COLUMN search_vector tsvector
+            GENERATED ALWAYS AS (to_tsvector('english', COALESCE(text, '') || ' ' || COALESCE(context, ''))) STORED
+        """)
 
     op.create_index("idx_memory_units_bank_id", "memory_units", ["bank_id"])
     op.create_index("idx_memory_units_document_id", "memory_units", ["document_id"])
@@ -200,19 +286,47 @@ def upgrade() -> None:
         ["bank_id", sa.text("event_date DESC")],
         postgresql_where=sa.text("fact_type = 'observation'"),
     )
-    op.create_index(
-        "idx_memory_units_embedding",
-        "memory_units",
-        ["embedding"],
-        postgresql_using="hnsw",
-        postgresql_ops={"embedding": "vector_cosine_ops"},
-    )
+    # Create vector index - conditional based on available extension
+    vector_ext = _detect_vector_extension()
 
-    # Create BM25 full-text search index on search_vector
-    op.execute("""
-        CREATE INDEX idx_memory_units_text_search ON memory_units
-        USING gin(search_vector)
-    """)
+    if vector_ext == "vchord":
+        # Use vchordrq index for vchord (supports high-dimensional embeddings)
+        op.execute("""
+            CREATE INDEX idx_memory_units_embedding ON memory_units
+            USING vchordrq (embedding vector_l2_ops)
+        """)
+    else:  # pgvector
+        # Use HNSW index for pgvector
+        op.create_index(
+            "idx_memory_units_embedding",
+            "memory_units",
+            ["embedding"],
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        )
+
+    # Create full-text search index on search_vector
+    # Index type depends on text search backend
+    if text_search_ext == "vchord":
+        # VectorChord BM25 index
+        op.execute("""
+            CREATE INDEX idx_memory_units_text_search ON memory_units
+            USING bm25 (search_vector bm25_catalog.bm25_ops)
+        """)
+    elif text_search_ext == "pg_textsearch":
+        # Timescale pg_textsearch BM25 index on text column
+        # Note: pg_textsearch doesn't support expressions, so we index the main text column
+        op.execute("""
+            CREATE INDEX idx_memory_units_text_search ON memory_units
+            USING bm25(text)
+            WITH (text_config='english')
+        """)
+    else:  # native
+        # Native PostgreSQL GIN index
+        op.execute("""
+            CREATE INDEX idx_memory_units_text_search ON memory_units
+            USING gin(search_vector)
+        """)
 
     op.execute("""
         CREATE MATERIALIZED VIEW memory_units_bm25 AS

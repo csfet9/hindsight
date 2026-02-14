@@ -33,10 +33,45 @@ def _parse_metadata(metadata: Any) -> dict[str, Any]:
 
 
 from enum import Enum
+from typing import Callable
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from hindsight_api import MemoryEngine
+
+
+def FieldWithDefault(default_factory: Callable, **kwargs) -> Any:
+    """
+    Field wrapper that ensures default_factory values appear in OpenAPI schema.
+
+    Pydantic doesn't include default_factory in OpenAPI schemas, causing OpenAPI
+    Generator to make fields Optional with default=None instead of non-optional
+    with the correct default value.
+
+    This wrapper adds json_schema_extra to include the default in the schema.
+    """
+    # Determine the default value for the schema based on the factory
+    if default_factory is list:
+        schema_default = []
+    elif default_factory is dict:
+        schema_default = {}
+    else:
+        # For custom factories (like IncludeOptions), use empty dict as placeholder
+        schema_default = {}
+
+    # Add or merge json_schema_extra
+    json_extra = kwargs.pop("json_schema_extra", {})
+    if isinstance(json_extra, dict):
+        json_extra["default"] = schema_default
+    else:
+        # If json_schema_extra was a function, we can't merge easily
+        # Fall back to just setting default
+        json_extra = {"default": schema_default}
+
+    return Field(default_factory=default_factory, json_schema_extra=json_extra, **kwargs)
+
+
+from hindsight_api.config import get_config
 from hindsight_api.engine.db_utils import acquire_with_retry
 from hindsight_api.engine.memory_engine import Budget, _get_tiktoken_encoding, fq_table
 from hindsight_api.engine.reflect.observations import Observation
@@ -105,8 +140,8 @@ class RecallRequest(BaseModel):
     query_timestamp: str | None = Field(
         default=None, description="ISO format date string (e.g., '2023-05-30T23:40:00')"
     )
-    include: IncludeOptions = Field(
-        default_factory=IncludeOptions,
+    include: IncludeOptions = FieldWithDefault(
+        IncludeOptions,
         description="Options for including additional data (entities are included by default)",
     )
     tags: list[str] | None = Field(
@@ -593,18 +628,16 @@ class ReflectLLMCall(BaseModel):
 class ReflectBasedOn(BaseModel):
     """Evidence the response is based on: memories, mental models, and directives."""
 
-    memories: list[ReflectFact] = Field(default_factory=list, description="Memory facts used to generate the response")
-    mental_models: list[ReflectMentalModel] = Field(
-        default_factory=list, description="Mental models used during reflection"
-    )
-    directives: list[ReflectDirective] = Field(default_factory=list, description="Directives applied during reflection")
+    memories: list[ReflectFact] = FieldWithDefault(list, description="Memory facts used to generate the response")
+    mental_models: list[ReflectMentalModel] = FieldWithDefault(list, description="Mental models used during reflection")
+    directives: list[ReflectDirective] = FieldWithDefault(list, description="Directives applied during reflection")
 
 
 class ReflectTrace(BaseModel):
     """Execution trace of LLM and tool calls during reflection."""
 
-    tool_calls: list[ReflectToolCall] = Field(default_factory=list, description="Tool calls made during reflection")
-    llm_calls: list[ReflectLLMCall] = Field(default_factory=list, description="LLM calls made during reflection")
+    tool_calls: list[ReflectToolCall] = FieldWithDefault(list, description="Tool calls made during reflection")
+    llm_calls: list[ReflectLLMCall] = FieldWithDefault(list, description="LLM calls made during reflection")
 
 
 class ReflectResponse(BaseModel):
@@ -816,6 +849,55 @@ class CreateBankRequest(BaseModel):
     background: str | None = Field(default=None, description="Deprecated: use mission instead")
 
 
+class BankConfigUpdate(BaseModel):
+    """Request model for updating bank configuration."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "updates": {
+                    "llm_model": "claude-sonnet-4-5",
+                    "retain_extraction_mode": "verbose",
+                    "retain_custom_instructions": "Extract technical details carefully",
+                }
+            }
+        }
+    )
+
+    updates: dict[str, Any] = Field(
+        description="Configuration overrides. Keys can be in Python field format (llm_provider) "
+        "or environment variable format (HINDSIGHT_API_LLM_PROVIDER). "
+        "Only hierarchical fields can be overridden per-bank."
+    )
+
+
+class BankConfigResponse(BaseModel):
+    """Response model for bank configuration."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "bank_id": "my-bank",
+                "config": {
+                    "llm_provider": "openai",
+                    "llm_model": "gpt-4",
+                    "retain_extraction_mode": "verbose",
+                },
+                "overrides": {
+                    "llm_model": "gpt-4",
+                    "retain_extraction_mode": "verbose",
+                },
+            }
+        }
+    )
+
+    bank_id: str = Field(description="Bank identifier")
+    config: dict[str, Any] = Field(
+        description="Fully resolved configuration with all hierarchical overrides applied (Python field names)"
+    )
+    overrides: dict[str, Any] = Field(description="Bank-specific configuration overrides only (Python field names)")
+
+
 class GraphDataResponse(BaseModel):
     """Response model for graph data endpoint."""
 
@@ -965,7 +1047,7 @@ class DocumentResponse(BaseModel):
     created_at: str
     updated_at: str
     memory_unit_count: int
-    tags: list[str] = Field(default_factory=list, description="Tags associated with this document")
+    tags: list[str] = FieldWithDefault(list, description="Tags associated with this document")
 
 
 class DeleteDocumentResponse(BaseModel):
@@ -1089,7 +1171,7 @@ class DirectiveResponse(BaseModel):
     content: str
     priority: int = 0
     is_active: bool = True
-    tags: list[str] = Field(default_factory=list)
+    tags: list[str] = FieldWithDefault(list)
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -1107,7 +1189,7 @@ class CreateDirectiveRequest(BaseModel):
     content: str = Field(description="The directive text to inject into prompts")
     priority: int = Field(default=0, description="Higher priority directives are injected first")
     is_active: bool = Field(default=True, description="Whether this directive is active")
-    tags: list[str] = Field(default_factory=list, description="Tags for filtering")
+    tags: list[str] = FieldWithDefault(list, description="Tags for filtering")
 
 
 class UpdateDirectiveRequest(BaseModel):
@@ -1144,9 +1226,9 @@ class MentalModelResponse(BaseModel):
     content: str = Field(
         description="The mental model content as well-formatted markdown (auto-generated from reflect endpoint)"
     )
-    tags: list[str] = Field(default_factory=list)
+    tags: list[str] = FieldWithDefault(list)
     max_tokens: int = Field(default=2048)
-    trigger: MentalModelTrigger = Field(default_factory=MentalModelTrigger)
+    trigger: MentalModelTrigger = FieldWithDefault(MentalModelTrigger)
     last_refreshed_at: str | None = None
     created_at: str | None = None
     reflect_response: dict | None = Field(
@@ -1182,9 +1264,9 @@ class CreateMentalModelRequest(BaseModel):
     )
     name: str = Field(description="Human-readable name for the mental model")
     source_query: str = Field(description="The query to run to generate content")
-    tags: list[str] = Field(default_factory=list, description="Tags for scoped visibility")
+    tags: list[str] = FieldWithDefault(list, description="Tags for scoped visibility")
     max_tokens: int = Field(default=2048, ge=256, le=8192, description="Maximum tokens for generated content")
-    trigger: MentalModelTrigger = Field(default_factory=MentalModelTrigger, description="Trigger settings")
+    trigger: MentalModelTrigger = FieldWithDefault(MentalModelTrigger, description="Trigger settings")
 
 
 class CreateMentalModelResponse(BaseModel):
@@ -1345,6 +1427,7 @@ class FeaturesInfo(BaseModel):
     observations: bool = Field(description="Whether observations (auto-consolidation) are enabled")
     mcp: bool = Field(description="Whether MCP (Model Context Protocol) server is enabled")
     worker: bool = Field(description="Whether the background worker is enabled")
+    bank_config_api: bool = Field(description="Whether per-bank configuration API is enabled")
 
 
 class VersionResponse(BaseModel):
@@ -1358,6 +1441,7 @@ class VersionResponse(BaseModel):
                     "observations": False,
                     "mcp": True,
                     "worker": True,
+                    "bank_config_api": False,
                 },
             }
         }
@@ -1423,6 +1507,26 @@ def create_app(
             app.state.prometheus_reader = None
             # Metrics collector is already initialized as no-op by default
 
+        # Initialize OpenTelemetry tracing if enabled
+        if config.otel_traces_enabled:
+            if not config.otel_exporter_otlp_endpoint:
+                logging.warning("OTEL tracing enabled but no endpoint configured. Tracing disabled.")
+            else:
+                from hindsight_api.tracing import create_span_recorder, initialize_tracing
+
+                try:
+                    initialize_tracing(
+                        service_name=config.otel_service_name,
+                        endpoint=config.otel_exporter_otlp_endpoint,
+                        headers=config.otel_exporter_otlp_headers,
+                        deployment_environment=config.otel_deployment_environment,
+                    )
+                    create_span_recorder()
+                    logging.info("OpenTelemetry tracing enabled and configured")
+                except Exception as e:
+                    logging.error(f"Failed to initialize tracing: {e}")
+                    logging.warning("Continuing without tracing")
+
         # Startup: Initialize database and memory system (migrations run inside initialize if enabled)
         if initialize_memory:
             await memory.initialize()
@@ -1455,6 +1559,12 @@ def create_app(
             poller_task = asyncio.create_task(poller.run())
             logging.info(f"Worker poller started (worker_id={worker_id})")
 
+        # Call tenant extension startup hook (e.g. JWKS fetch for Supabase)
+        tenant_extension = memory.tenant_extension
+        if tenant_extension:
+            await tenant_extension.on_startup()
+            logging.info("Tenant extension started")
+
         # Call HTTP extension startup hook
         if http_extension:
             await http_extension.on_startup()
@@ -1473,6 +1583,11 @@ def create_app(
                     pass
             logging.info("Worker poller stopped")
 
+        # Call tenant extension shutdown hook
+        if tenant_extension:
+            await tenant_extension.on_shutdown()
+            logging.info("Tenant extension stopped")
+
         # Call HTTP extension shutdown hook
         if http_extension:
             await http_extension.on_shutdown()
@@ -1483,6 +1598,9 @@ def create_app(
         logging.info("Memory system closed")
 
     from hindsight_api import __version__
+    from hindsight_api.config import get_config
+
+    config = get_config()
 
     app = FastAPI(
         title="Hindsight HTTP API",
@@ -1496,6 +1614,7 @@ def create_app(
             "url": "https://www.apache.org/licenses/LICENSE-2.0.html",
         },
         lifespan=lifespan,
+        root_path=config.base_path,
     )
 
     # IMPORTANT: Set memory on app.state immediately, don't wait for lifespan
@@ -1602,17 +1721,21 @@ def _register_routes(app: FastAPI):
 
         Returns version info and feature flags that can be used by clients
         to determine which capabilities are available.
+
+        Note: observations flag shows the global default. Individual banks
+        may override this setting via bank-specific configuration.
         """
         from hindsight_api import __version__
-        from hindsight_api.config import get_config
+        from hindsight_api.config import _get_raw_config
 
-        config = get_config()
+        config = _get_raw_config()
         return VersionResponse(
             api_version=__version__,
             features=FeaturesInfo(
                 observations=config.enable_observations,
                 mcp=config.mcp_enabled,
                 worker=config.worker_enabled,
+                bank_config_api=config.enable_bank_config_api,
             ),
         )
 
@@ -2346,23 +2469,6 @@ def _register_routes(app: FastAPI):
     ):
         """Get a mental model by ID."""
         try:
-            # Pre-operation validation hook
-            validator = app.state.memory._operation_validator
-            if validator:
-                from hindsight_api.extensions.operation_validator import MentalModelGetContext
-
-                ctx = MentalModelGetContext(
-                    bank_id=bank_id,
-                    mental_model_id=mental_model_id,
-                    request_context=request_context,
-                )
-                validation = await validator.validate_mental_model_get(ctx)
-                if not validation.allowed:
-                    raise OperationValidationError(
-                        validation.reason or "Operation not allowed",
-                        status_code=validation.status_code,
-                    )
-
             mental_model = await app.state.memory.get_mental_model(
                 bank_id=bank_id,
                 mental_model_id=mental_model_id,
@@ -2370,25 +2476,6 @@ def _register_routes(app: FastAPI):
             )
             if mental_model is None:
                 raise HTTPException(status_code=404, detail=f"Mental model '{mental_model_id}' not found")
-
-            # Post-operation hook
-            if validator:
-                from hindsight_api.extensions.operation_validator import MentalModelGetResult
-
-                content = mental_model.get("content", "")
-                output_tokens = len(content) // 4 if content else 0
-
-                result_ctx = MentalModelGetResult(
-                    bank_id=bank_id,
-                    mental_model_id=mental_model_id,
-                    request_context=request_context,
-                    output_tokens=output_tokens,
-                    success=True,
-                )
-                try:
-                    await validator.on_mental_model_get_complete(result_ctx)
-                except Exception as hook_err:
-                    logger.warning(f"Post-mental-model-get hook error (non-fatal): {hook_err}")
 
             return MentalModelResponse(**mental_model)
         except (AuthenticationError, HTTPException):
@@ -2419,23 +2506,6 @@ def _register_routes(app: FastAPI):
     ):
         """Create a mental model (async - returns operation_id)."""
         try:
-            # Pre-operation validation hook
-            validator = app.state.memory._operation_validator
-            if validator:
-                from hindsight_api.extensions.operation_validator import MentalModelRefreshContext
-
-                ctx = MentalModelRefreshContext(
-                    bank_id=bank_id,
-                    mental_model_id=None,  # Not yet created
-                    request_context=request_context,
-                )
-                validation = await validator.validate_mental_model_refresh(ctx)
-                if not validation.allowed:
-                    raise OperationValidationError(
-                        validation.reason or "Operation not allowed",
-                        status_code=validation.status_code,
-                    )
-
             # 1. Create the mental model with placeholder content
             mental_model = await app.state.memory.create_mental_model(
                 bank_id=bank_id,
@@ -2483,23 +2553,6 @@ def _register_routes(app: FastAPI):
     ):
         """Refresh a mental model by re-running its source query (async)."""
         try:
-            # Pre-operation validation hook
-            validator = app.state.memory._operation_validator
-            if validator:
-                from hindsight_api.extensions.operation_validator import MentalModelRefreshContext
-
-                ctx = MentalModelRefreshContext(
-                    bank_id=bank_id,
-                    mental_model_id=mental_model_id,
-                    request_context=request_context,
-                )
-                validation = await validator.validate_mental_model_refresh(ctx)
-                if not validation.allowed:
-                    raise OperationValidationError(
-                        validation.reason or "Operation not allowed",
-                        status_code=validation.status_code,
-                    )
-
             result = await app.state.memory.submit_async_refresh_mental_model(
                 bank_id=bank_id,
                 mental_model_id=mental_model_id,
@@ -3334,6 +3387,112 @@ def _register_routes(app: FastAPI):
 
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.error(f"Error in DELETE /v1/default/banks/{bank_id}/observations: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/config",
+        response_model=BankConfigResponse,
+        summary="Get bank configuration",
+        description="Get fully resolved configuration for a bank including all hierarchical overrides (global → tenant → bank). "
+        "The 'config' field contains all resolved config values. The 'overrides' field shows only bank-specific overrides.",
+        operation_id="get_bank_config",
+        tags=["Banks"],
+    )
+    async def api_get_bank_config(bank_id: str, request_context: RequestContext = Depends(get_request_context)):
+        """Get configuration for a bank with all hierarchical overrides applied."""
+        if not get_config().enable_bank_config_api:
+            raise HTTPException(
+                status_code=404,
+                detail="Bank configuration API is disabled. Set HINDSIGHT_API_ENABLE_BANK_CONFIG_API=true to enable.",
+            )
+        try:
+            # Get resolved config from config resolver
+            config_dict = await app.state.memory._config_resolver.get_bank_config(bank_id, request_context)
+
+            # Get bank-specific overrides only
+            bank_overrides = await app.state.memory._config_resolver._load_bank_config(bank_id)
+
+            return BankConfigResponse(bank_id=bank_id, config=config_dict, overrides=bank_overrides)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in GET /v1/default/banks/{bank_id}/config: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.patch(
+        "/v1/default/banks/{bank_id}/config",
+        response_model=BankConfigResponse,
+        summary="Update bank configuration",
+        description="Update configuration overrides for a bank. Only hierarchical fields can be overridden (LLM settings, retention parameters, etc.). "
+        "Keys can be provided in Python field format (llm_provider) or environment variable format (HINDSIGHT_API_LLM_PROVIDER).",
+        operation_id="update_bank_config",
+        tags=["Banks"],
+    )
+    async def api_update_bank_config(
+        bank_id: str, request: BankConfigUpdate, request_context: RequestContext = Depends(get_request_context)
+    ):
+        """Update configuration overrides for a bank."""
+        if not get_config().enable_bank_config_api:
+            raise HTTPException(
+                status_code=404,
+                detail="Bank configuration API is disabled. Set HINDSIGHT_API_ENABLE_BANK_CONFIG_API=true to enable.",
+            )
+        try:
+            # Update config via config resolver (validates configurable fields and permissions)
+            await app.state.memory._config_resolver.update_bank_config(bank_id, request.updates, request_context)
+
+            # Return updated config
+            config_dict = await app.state.memory._config_resolver.get_bank_config(bank_id, request_context)
+            bank_overrides = await app.state.memory._config_resolver._load_bank_config(bank_id)
+
+            return BankConfigResponse(bank_id=bank_id, config=config_dict, overrides=bank_overrides)
+        except ValueError as e:
+            # Validation error (e.g., trying to override static field)
+            raise HTTPException(status_code=400, detail=str(e))
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in PATCH /v1/default/banks/{bank_id}/config: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.delete(
+        "/v1/default/banks/{bank_id}/config",
+        response_model=BankConfigResponse,
+        summary="Reset bank configuration",
+        description="Reset bank configuration to defaults by removing all bank-specific overrides. "
+        "The bank will then use global and tenant-level configuration only.",
+        operation_id="reset_bank_config",
+        tags=["Banks"],
+    )
+    async def api_reset_bank_config(bank_id: str, request_context: RequestContext = Depends(get_request_context)):
+        """Reset bank configuration to defaults (remove all overrides)."""
+        if not get_config().enable_bank_config_api:
+            raise HTTPException(
+                status_code=404,
+                detail="Bank configuration API is disabled. Set HINDSIGHT_API_ENABLE_BANK_CONFIG_API=true to enable.",
+            )
+        try:
+            # Reset config via config resolver
+            await app.state.memory._config_resolver.reset_bank_config(bank_id)
+
+            # Return updated config (should match defaults now)
+            config_dict = await app.state.memory._config_resolver.get_bank_config(bank_id, request_context)
+            bank_overrides = await app.state.memory._config_resolver._load_bank_config(bank_id)
+
+            return BankConfigResponse(bank_id=bank_id, config=config_dict, overrides=bank_overrides)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in DELETE /v1/default/banks/{bank_id}/config: {error_detail}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post(

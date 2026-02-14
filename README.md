@@ -2,7 +2,7 @@
 
 ![Hindsight Banner](./hindsight-docs/static/img/hindsight-github-banner.png)
 
-[Documentation](https://hindsight.vectorize.io) • [Paper](https://arxiv.org/abs/2512.12818) • [Cookbook](https://hindsight.vectorize.io/cookbook) • [Hindsight Cloud](https://vectorize.io/hindsight/cloud)
+[Documentation](https://hindsight.vectorize.io) • [Paper](https://arxiv.org/abs/2512.12818) • [Cookbook](https://hindsight.vectorize.io/cookbook) • [Hindsight Cloud](https://ui.hindsight.vectorize.io/signup)
 
 [![CI](https://github.com/vectorize-io/hindsight/actions/workflows/release.yml/badge.svg)](https://github.com/vectorize-io/hindsight/actions/workflows/release.yml)
 [![Slack Community](https://img.shields.io/badge/Slack-Join%20Community-4A154B?logo=slack)](https://join.slack.com/t/hindsight-space/shared_invite/zt-3nhbm4w29-LeSJ5Ixi6j8PdiYOCPlOgg)
@@ -42,27 +42,51 @@ If you need more control over how and when your agent stores and recalls memorie
 
 ![Hindsight Banner](./hindsight-docs/static/img/migration-code.png)
 
+---
+
+> 🤖 **Using a coding agent?** Install the Hindsight documentation skill for instant access to docs while you code:
+> ```bash
+> npx skills add https://github.com/vectorize-io/hindsight --skill hindsight-docs
+> ```
+> Works with Claude Code, Cursor, and other AI coding assistants.
+
+---
+
 
 ## Quick Start
 
 ### Docker (recommended)
 
 ```bash
-export OPENAI_API_KEY=your-key
+export OPENAI_API_KEY=sk-xxx
 
 docker run --rm -it --pull always -p 8888:8888 -p 9999:9999 \
   -e HINDSIGHT_API_LLM_API_KEY=$OPENAI_API_KEY \
-  -e HINDSIGHT_API_LLM_MODEL=o3-mini \
   -v $HOME/.hindsight-docker:/home/hindsight/.pg0 \
   ghcr.io/vectorize-io/hindsight:latest
 ```
 
+>API: http://localhost:8888
+>UI: http://localhost:9999
+
 You can modify the LLM provider by setting `HINDSIGHT_API_LLM_PROVIDER`. Valid options are `openai`, `anthropic`, `gemini`, `groq`, `ollama`, and `lmstudio`. The documentation provides more details on [supported models](https://hindsight.vectorize.io/developer/models).
 
-API: http://localhost:8888
-UI: http://localhost:9999
 
-Install client:
+
+### Docker (external PostgreSQL)
+
+```bash
+export OPENAI_API_KEY=sk-xxx
+export HINDSIGHT_DB_PASSWORD=choose-a-password
+cd docker/docker-compose
+docker compose up 
+```
+
+
+>API: http://localhost:8888
+>UI: http://localhost:9999
+
+### Client
 
 ```bash
 pip install hindsight-client -U
@@ -70,7 +94,7 @@ pip install hindsight-client -U
 npm install @vectorize-io/hindsight-client
 ```
 
-Python example:
+#### Python
 
 ```python
 from hindsight_client import Hindsight
@@ -87,7 +111,29 @@ client.recall(bank_id="my-bank", query="What does Alice do?")
 client.reflect(bank_id="my-bank", query="Tell me about Alice")
 ```
 
-### Python (embedded, no Docker)
+#### Node.js / TypeScript
+
+```bash
+npm install @vectorize-io/hindsight-client
+```
+
+```javascript
+const { HindsightClient } = require('@vectorize-io/hindsight-client');
+
+const main = async () => {
+  const client = new HindsightClient({ baseUrl: 'http://localhost:8888' });
+
+  await client.retain('my-bank', 'Alice loves hiking in Yosemite');
+
+  const results = await client.recall('my-bank', 'What does Alice like?');
+  console.log(results);
+}
+
+main();
+```
+
+
+### Python Embedded (no server required)
 
 ```bash
 pip install hindsight-all -U
@@ -107,26 +153,6 @@ with HindsightServer(
     results = client.recall(bank_id="my-bank", query="Where does Alice work?")
 ```
 
-### Node.js / TypeScript
-
-```bash
-npm install @vectorize-io/hindsight-client
-```
-
-```javascript
-const { HindsightClient } = require('@vectorize-io/hindsight-client');
-
-const example = async () => {
-  const client = new HindsightClient({ baseUrl: 'http://localhost:8888' });
-
-  await client.retain('my-bank', 'Alice loves hiking in Yosemite');
-
-  const results = await client.recall('my-bank', 'What does Alice like?');
-  console.log(results);
-}
-
-example();
-```
 
 ---
 

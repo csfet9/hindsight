@@ -1146,6 +1146,7 @@ async def _extract_facts_from_chunk(
     event_date: datetime,
     context: str,
     llm_config: "LLMConfig",
+    config,
     agent_name: str = None,
     extract_opinions: bool = False,
     content_type: str = "prose",
@@ -1186,7 +1187,6 @@ async def _extract_facts_from_chunk(
     use_code_prompt = content_type in ("code", "diff")
 
     # Check config for extraction mode and causal link extraction
-    config = get_config()
     extraction_mode = config.retain_extraction_mode
     extract_causal_links = config.retain_extract_causal_links
 
@@ -1272,7 +1272,7 @@ Text:
             extraction_response_json, call_usage = await llm_config.call(
                 messages=[{"role": "system", "content": prompt}, {"role": "user", "content": user_message}],
                 response_format=response_schema,
-                scope="memory_extract_facts",
+                scope="retain_extract_facts",
                 temperature=0.1,
                 max_completion_tokens=config.retain_max_completion_tokens,
                 max_retries=max_retries,
@@ -1525,6 +1525,7 @@ async def _extract_facts_with_auto_split(
     event_date: datetime,
     context: str,
     llm_config: LLMConfig,
+    config,
     agent_name: str = None,
     extract_opinions: bool = False,
     content_type: str = "prose",
@@ -1542,6 +1543,7 @@ async def _extract_facts_with_auto_split(
         event_date: Reference date for temporal information
         context: Context about the conversation/document
         llm_config: LLM configuration to use
+        config: Resolved HindsightConfig for this bank
         agent_name: Optional agent name (memory owner)
         extract_opinions: If True, extract ONLY opinions. If False, extract world and agent facts (no opinions)
         content_type: "prose", "code", or "diff" - affects extraction prompt
@@ -1562,6 +1564,7 @@ async def _extract_facts_with_auto_split(
             event_date=event_date,
             context=context,
             llm_config=llm_config,
+            config=config,
             agent_name=agent_name,
             extract_opinions=extract_opinions,
             content_type=content_type,
@@ -1608,6 +1611,7 @@ async def _extract_facts_with_auto_split(
                 event_date=event_date,
                 context=context,
                 llm_config=llm_config,
+                config=config,
                 agent_name=agent_name,
                 extract_opinions=extract_opinions,
                 content_type=content_type,
@@ -1619,6 +1623,7 @@ async def _extract_facts_with_auto_split(
                 event_date=event_date,
                 context=context,
                 llm_config=llm_config,
+                config=config,
                 agent_name=agent_name,
                 extract_opinions=extract_opinions,
                 content_type=content_type,
@@ -1644,6 +1649,7 @@ async def extract_facts_from_text(
     event_date: datetime,
     llm_config: LLMConfig,
     agent_name: str,
+    config,
     context: str = "",
     extract_opinions: bool = False,
     content_type: str = "auto",
@@ -1660,11 +1666,10 @@ async def extract_facts_from_text(
     Args:
         text: Input text (conversation, article, etc.)
         event_date: Reference date for resolving relative times
-        context: Context about the conversation/document
         llm_config: LLM configuration to use
         agent_name: Agent name (memory owner)
-        extract_opinions: If True, extract ONLY opinions. If False, extract world and bank facts (no opinions)
-        content_type: "prose", "code", "diff", or "auto" (auto-detect)
+        config: Resolved HindsightConfig for this bank
+        context: Context about the conversation/document
 
     Returns:
         Tuple of (facts, chunks, usage) where:
@@ -1672,14 +1677,7 @@ async def extract_facts_from_text(
         - chunks: List of tuples (chunk_text, fact_count) for each chunk
         - usage: Aggregated token usage across all LLM calls
     """
-    # Auto-detect content type if needed
-    actual_content_type = content_type
-    if content_type == "auto":
-        actual_content_type = detect_content_type(text)
-
-    # Use content-aware chunking with configurable chunk size
-    config = get_config()
-    chunks = chunk_text(text, max_chars=config.retain_chunk_size, content_type=actual_content_type)
+    chunks = chunk_text(text, max_chars=config.retain_chunk_size)
 
     # Log chunk count before starting LLM requests
     total_chars = sum(len(c) for c in chunks)
@@ -1689,7 +1687,6 @@ async def extract_facts_from_text(
             f"chunk_size={config.retain_chunk_size:,}) - starting parallel LLM extraction"
         )
 
-
     tasks = [
         _extract_facts_with_auto_split(
             chunk=chunk,
@@ -1698,6 +1695,7 @@ async def extract_facts_from_text(
             event_date=event_date,
             context=context,
             llm_config=llm_config,
+            config=config,
             agent_name=agent_name,
             extract_opinions=extract_opinions,
             content_type=actual_content_type,
@@ -1732,7 +1730,7 @@ SECONDS_PER_FACT = 10
 
 
 async def extract_facts_from_contents(
-    contents: list[RetainContent], llm_config, agent_name: str, extract_opinions: bool = False
+    contents: list[RetainContent], llm_config, agent_name: str, config
 ) -> tuple[list[ExtractedFactType], list[ChunkMetadata], TokenUsage]:
     """
     Extract facts from multiple content items in parallel.
@@ -1747,6 +1745,7 @@ async def extract_facts_from_contents(
         contents: List of RetainContent objects to process
         llm_config: LLM configuration for fact extraction
         agent_name: Name of the agent (for agent-related fact detection)
+        config: Resolved HindsightConfig for this bank
 
     Returns:
         Tuple of (extracted_facts, chunks_metadata, usage)
@@ -1765,8 +1764,7 @@ async def extract_facts_from_contents(
             context=item.context,
             llm_config=llm_config,
             agent_name=agent_name,
-            extract_opinions=extract_opinions,
-            content_type=item.content_type,
+            config=config,
         )
         fact_extraction_tasks.append(task)
 
