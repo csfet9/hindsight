@@ -5,6 +5,7 @@ import { client } from "@/lib/api";
 import { useBank } from "@/lib/bank-context";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { toast } from "sonner";
 import {
   Select,
   SelectContent,
@@ -99,7 +100,9 @@ export function SearchDebugView() {
 
   const runSearch = async () => {
     if (!currentBank) {
-      alert("Please select a memory bank first");
+      toast.error("Validation error", {
+        description: "Please select a memory bank first",
+      });
       return;
     }
 
@@ -109,7 +112,9 @@ export function SearchDebugView() {
 
     // Must select at least one type
     if (factTypes.length === 0) {
-      alert("Please select at least one type (World, Experience, or Observations)");
+      toast.error("Validation error", {
+        description: "Please select at least one type (World, Experience, or Observations)",
+      });
       return;
     }
 
@@ -146,8 +151,7 @@ export function SearchDebugView() {
       setTrace(data.trace || null);
       setViewMode("results");
     } catch (error) {
-      console.error("Error running search:", error);
-      alert("Error running search: " + (error as Error).message);
+      // Error toast is shown automatically by the API client interceptor
     } finally {
       setLoading(false);
     }
@@ -867,7 +871,7 @@ export function SearchDebugView() {
                               </div>
                               <div className="text-sm text-muted-foreground mt-0.5">
                                 <span className="font-mono text-xs">
-                                  0.6×cross_encoder + 0.2×rrf + 0.1×temporal + 0.1×recency
+                                  ce × recency_boost(±10%) × temporal_boost(±10%)
                                 </span>
                               </div>
                             </div>
@@ -920,24 +924,17 @@ export function SearchDebugView() {
                                             = {(r.rerank_score || r.score || 0).toFixed(4)}
                                           </span>
                                           {sc.cross_encoder_score_normalized !== undefined && (
-                                            <span title="Cross-encoder (60%)">
+                                            <span title="Cross-encoder score (primary relevance signal)">
                                               CE: {sc.cross_encoder_score_normalized.toFixed(3)}
                                             </span>
                                           )}
-                                          {sc.rrf_normalized !== undefined && (
-                                            <span
-                                              title={`RRF normalized (20%) - raw: ${sc.rrf_score?.toFixed(4) || "N/A"}`}
-                                            >
-                                              RRF: {sc.rrf_normalized.toFixed(3)}
-                                            </span>
-                                          )}
-                                          {sc.temporal !== undefined && (
-                                            <span title="Temporal proximity (10%)">
+                                          {sc.temporal !== undefined && sc.temporal !== 0.5 && (
+                                            <span title="Temporal proximity boost (±10% — only active for temporal queries)">
                                               Tmp: {sc.temporal.toFixed(3)}
                                             </span>
                                           )}
                                           {sc.recency !== undefined && (
-                                            <span title="Recency (10%)">
+                                            <span title="Recency boost (±10% — based on memory age)">
                                               Rec: {sc.recency.toFixed(3)}
                                             </span>
                                           )}

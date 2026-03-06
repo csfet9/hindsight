@@ -2,6 +2,9 @@ import {themes as prismThemes} from 'prism-react-renderer';
 import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
 
+const umamiUrl = process.env.UMAMI_URL;
+const umamiWebsiteId = process.env.UMAMI_WEBSITE_ID;
+
 // Announcement bar - supports HTML for links
 // Set to empty string '' to hide the bar
 const ANNOUNCEMENT_BAR = 'Hindsight is State-of-the-Art on Memory for AI Agents | <a href="https://arxiv.org/abs/2512.12818" target="_blank">Read the paper →</a>';
@@ -58,6 +61,28 @@ const config: Config = {
         onload: "this.media='all'",
       },
     },
+    {
+      tagName: 'script',
+      attributes: {},
+      innerHTML: `window.dataLayer = window.dataLayer || [];function gtag(){dataLayer.push(arguments);}gtag('js', new Date());gtag('config', 'AW-16635605869');`,
+    },
+  ],
+
+  scripts: [
+    ...(umamiUrl && umamiWebsiteId
+      ? [
+          {
+            src: `${umamiUrl}/script.js`,
+            async: true,
+            defer: true,
+            'data-website-id': umamiWebsiteId,
+          },
+        ]
+      : []),
+    {
+      src: 'https://www.googletagmanager.com/gtag/js?id=AW-16635605869',
+      async: true,
+    },
   ],
 
   presets: [
@@ -101,8 +126,7 @@ const config: Config = {
           blogTitle: 'Hindsight Blog',
           blogDescription: 'Updates, insights, and deep dives into agent memory',
           postsPerPage: 10,
-          blogSidebarTitle: 'Recent posts',
-          blogSidebarCount: 'ALL',
+          blogSidebarCount: 0,
         },
         theme: {
           customCss: './src/css/custom.css',
@@ -201,23 +225,10 @@ const config: Config = {
           className: 'navbar-item-sdks',
         },
         {
-          to: '/api-reference',
+          to: '/faq',
           position: 'left',
-          label: 'API Reference',
-          className: 'navbar-item-api',
-        },
-        {
-          type: 'doc',
-          docId: 'cookbook/index',
-          position: 'left',
-          label: 'Cookbook',
-          className: 'navbar-item-cookbook',
-        },
-        {
-          to: '/blog',
-          position: 'left',
-          label: 'Blog',
-          className: 'navbar-item-blog',
+          label: 'FAQ',
+          className: 'navbar-item-faq',
         },
         {
           to: '/changelog',
@@ -226,19 +237,39 @@ const config: Config = {
           className: 'navbar-item-changelog',
         },
         {
+          type: 'dropdown',
+          label: 'Resources',
+          position: 'left',
+          className: 'navbar-item-resources',
+          items: [
+            {
+              to: '/cookbook',
+              label: 'Cookbook',
+            },
+            {
+              to: '/blog',
+              label: 'Blog',
+            },
+            {
+              to: '/api-reference',
+              label: 'API Reference',
+            },
+            {
+              href: 'https://join.slack.com/t/hindsight-space/shared_invite/zt-3nhbm4w29-LeSJ5Ixi6j8PdiYOCPlOgg',
+              label: 'Community',
+            },
+          ],
+        },
+        {
           href: 'https://ui.hindsight.vectorize.io/signup',
           position: 'right',
-          label: 'Hindsight Cloud',
+          label: 'Cloud',
           className: 'navbar-item-cloud',
         },
         {
           type: 'docsVersionDropdown',
           position: 'right',
-        },
-        {
-          href: 'https://join.slack.com/t/hindsight-space/shared_invite/zt-3nhbm4w29-LeSJ5Ixi6j8PdiYOCPlOgg',
-          position: 'right',
-          label: 'Community',
+          className: 'navbar-item-version',
         },
         {
           href: 'https://github.com/vectorize-io/hindsight',

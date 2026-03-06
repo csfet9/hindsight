@@ -14,6 +14,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .exceptions import RetryTaskAt
+
 if TYPE_CHECKING:
     import asyncpg
 
@@ -57,7 +59,6 @@ class WorkerPoller:
         worker_id: str,
         executor: Callable[[dict[str, Any]], Awaitable[None]],
         poll_interval_ms: int = 500,
-        max_retries: int = 3,
         schema: str | None = None,
         tenant_extension: "TenantExtension | None" = None,
         max_slots: int = 10,
@@ -71,7 +72,6 @@ class WorkerPoller:
             worker_id: Unique identifier for this worker
             executor: Async function to execute tasks (typically MemoryEngine.execute_task)
             poll_interval_ms: Interval between polls when no tasks found (milliseconds)
-            max_retries: Maximum retry attempts before marking task as failed
             schema: Database schema for single-tenant support (deprecated, use tenant_extension)
             tenant_extension: Extension for dynamic multi-tenant discovery. If None, creates a
                             DefaultTenantExtension with the configured schema.
@@ -82,7 +82,6 @@ class WorkerPoller:
         self._worker_id = worker_id
         self._executor = executor
         self._poll_interval_ms = poll_interval_ms
-        self._max_retries = max_retries
         self._schema = schema
         # Always set tenant extension (use DefaultTenantExtension if none provided)
         if tenant_extension is None:
@@ -218,11 +217,12 @@ class WorkerPoller:
                 # 1. Claim non-consolidation tasks (up to limit)
                 non_consolidation_rows = await conn.fetch(
                     f"""
-                    SELECT operation_id, task_payload
+                    SELECT operation_id, task_payload, retry_count
                     FROM {table}
                     WHERE status = 'pending'
                       AND task_payload IS NOT NULL
                       AND operation_type != 'consolidation'
+                      AND (next_retry_at IS NULL OR next_retry_at <= NOW())
                     ORDER BY created_at
                     LIMIT $1
                     FOR UPDATE SKIP LOCKED
@@ -238,11 +238,12 @@ class WorkerPoller:
                 if consolidation_limit > 0 and remaining_limit > 0:
                     consolidation_rows = await conn.fetch(
                         f"""
-                        SELECT operation_id, task_payload
+                        SELECT operation_id, task_payload, retry_count
                         FROM {table} AS pending
                         WHERE status = 'pending'
                           AND task_payload IS NOT NULL
                           AND operation_type = 'consolidation'
+                          AND (next_retry_at IS NULL OR next_retry_at <= NOW())
                           AND NOT EXISTS (
                               SELECT 1 FROM {table} AS processing
                               WHERE processing.bank_id = pending.bank_id
@@ -274,14 +275,19 @@ class WorkerPoller:
                 )
 
                 # Parse and return task payloads with schema context
-                return [
-                    ClaimedTask(
-                        operation_id=str(row["operation_id"]),
-                        task_dict=json.loads(row["task_payload"]),
-                        schema=schema,
+                result = []
+                for row in all_rows:
+                    task_dict = json.loads(row["task_payload"])
+                    task_dict["_retry_count"] = row["retry_count"]
+                    task_dict["_operation_id"] = str(row["operation_id"])
+                    result.append(
+                        ClaimedTask(
+                            operation_id=str(row["operation_id"]),
+                            task_dict=task_dict,
+                            schema=schema,
+                        )
                     )
-                    for row in all_rows
-                ]
+                return result
 
     async def _mark_completed(self, operation_id: str, schema: str | None):
         """Mark a task as completed."""
@@ -310,40 +316,22 @@ class WorkerPoller:
             error_message,
         )
 
-    async def _retry_or_fail(self, operation_id: str, error_message: str, schema: str | None):
-        """Increment retry count or mark as failed if max retries exceeded."""
+    async def _schedule_retry(self, operation_id: str, retry_at: "Any", error_message: str, schema: str | None):
+        """Reset task to pending with a future retry timestamp."""
         table = fq_table("async_operations", schema)
-
-        # Get current retry count
-        row = await self._pool.fetchrow(
-            f"SELECT retry_count FROM {table} WHERE operation_id = $1",
+        error_message = error_message[:5000] if len(error_message) > 5000 else error_message
+        await self._pool.execute(
+            f"""
+            UPDATE {table}
+            SET status = 'pending', next_retry_at = $2, worker_id = NULL, claimed_at = NULL,
+                retry_count = retry_count + 1, error_message = $3, updated_at = now()
+            WHERE operation_id = $1
+            """,
             operation_id,
+            retry_at,
+            error_message,
         )
-
-        if row is None:
-            logger.warning(f"Operation {operation_id} not found, cannot retry")
-            return
-
-        retry_count = row["retry_count"]
-
-        if retry_count >= self._max_retries:
-            # Max retries exceeded, mark as failed
-            await self._mark_failed(
-                operation_id, f"Max retries ({self._max_retries}) exceeded. Last error: {error_message}", schema
-            )
-            logger.error(f"Task {operation_id} failed after {retry_count} retries")
-        else:
-            # Increment retry and reset to pending
-            await self._pool.execute(
-                f"""
-                UPDATE {table}
-                SET status = 'pending', worker_id = NULL, claimed_at = NULL,
-                    retry_count = retry_count + 1, updated_at = now()
-                WHERE operation_id = $1
-                """,
-                operation_id,
-            )
-            logger.warning(f"Task {operation_id} failed, will retry (attempt {retry_count + 1}/{self._max_retries})")
+        logger.warning(f"Task {operation_id} scheduled for retry at {retry_at}: {error_message}")
 
     async def execute_task(self, task: ClaimedTask):
         """Execute a single task as a background job (fire-and-forget)."""
@@ -376,7 +364,13 @@ class WorkerPoller:
                         del self._in_flight_by_type[operation_type]
 
     async def _execute_task_inner(self, task: ClaimedTask):
-        """Inner task execution with error handling."""
+        """Inner task execution with retry/fail handling.
+
+        Tasks that want to be retried raise RetryTaskAt; the poller sets next_retry_at
+        and resets status to 'pending'. All other exceptions are marked as failed immediately.
+        Non-retryable failures (e.g., file_convert_retain) are handled by the executor
+        internally — it marks the operation as failed and returns normally.
+        """
         task_type = task.task_dict.get("type", "unknown")
         bank_id = task.task_dict.get("bank_id", "unknown")
 
@@ -386,12 +380,13 @@ class WorkerPoller:
             if task.schema:
                 task.task_dict["_schema"] = task.schema
             await self._executor(task.task_dict)
-            await self._mark_completed(task.operation_id, task.schema)
-            logger.debug(f"Task {task.operation_id} completed successfully")
+            logger.debug(f"Task {task.operation_id} execution finished")
+        except RetryTaskAt as e:
+            await self._schedule_retry(task.operation_id, e.retry_at, str(e), task.schema)
         except Exception as e:
-            error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
             logger.error(f"Task {task.operation_id} failed: {e}")
-            await self._retry_or_fail(task.operation_id, error_msg, task.schema)
+            traceback.print_exc()
+            await self._mark_failed(task.operation_id, str(e), task.schema)
 
     async def recover_own_tasks(self) -> int:
         """
@@ -400,6 +395,8 @@ class WorkerPoller:
         This handles the case where a worker crashes while processing tasks.
         On startup, we reset any tasks stuck in 'processing' for this worker_id
         back to 'pending' so they can be picked up again.
+
+        Also recovers batch API operations that were in-flight.
 
         If tenant_extension is configured, recovers across all tenant schemas.
 
@@ -413,11 +410,16 @@ class WorkerPoller:
             try:
                 table = fq_table("async_operations", schema)
 
+                # First, recover batch API operations (before resetting worker tasks)
+                batch_count = await self._recover_batch_operations(schema)
+                total_count += batch_count
+
+                # Then reset normal worker tasks
                 result = await self._pool.execute(
                     f"""
                     UPDATE {table}
                     SET status = 'pending', worker_id = NULL, claimed_at = NULL, updated_at = now()
-                    WHERE status = 'processing' AND worker_id = $1
+                    WHERE status = 'processing' AND worker_id = $1 AND result_metadata->>'batch_id' IS NULL
                     """,
                     self._worker_id,
                 )
@@ -433,6 +435,80 @@ class WorkerPoller:
         if total_count > 0:
             logger.info(f"Worker {self._worker_id} recovered {total_count} stale tasks from previous run")
         return total_count
+
+    async def _recover_batch_operations(self, schema: str | None) -> int:
+        """
+        Recover batch API operations that were in-flight when worker crashed.
+
+        Finds operations with batch_id in metadata and re-submits them as tasks
+        so polling can resume.
+
+        Args:
+            schema: Database schema to recover from
+
+        Returns:
+            Number of batch operations recovered
+        """
+        table = fq_table("async_operations", schema)
+
+        try:
+            # Find operations with batch_id in metadata (batch API operations)
+            rows = await self._pool.fetch(
+                f"""
+                SELECT operation_id, task_payload, result_metadata
+                FROM {table}
+                WHERE status = 'processing'
+                  AND result_metadata ? 'batch_id'
+                  AND task_payload IS NOT NULL
+                """
+            )
+
+            if not rows:
+                return 0
+
+            recovered = 0
+            for row in rows:
+                operation_id = str(row["operation_id"])
+                task_payload = row["task_payload"]
+                result_metadata = row["result_metadata"]
+
+                # Parse metadata
+                if isinstance(result_metadata, str):
+                    result_metadata = json.loads(result_metadata)
+
+                batch_id = result_metadata.get("batch_id")
+                batch_provider = result_metadata.get("batch_provider", "openai")
+
+                logger.info(
+                    f"Recovering batch operation: operation_id={operation_id}, batch_id={batch_id}, provider={batch_provider}"
+                )
+
+                # Parse task_payload
+                if isinstance(task_payload, str):
+                    task_dict = json.loads(task_payload)
+                else:
+                    task_dict = task_payload
+
+                # Mark operation as ready for re-processing
+                # Reset to pending with task_payload intact so worker picks it up again
+                await self._pool.execute(
+                    f"""
+                    UPDATE {table}
+                    SET status = 'pending', worker_id = NULL, claimed_at = NULL, updated_at = now()
+                    WHERE operation_id = $1
+                    """,
+                    operation_id,
+                )
+
+                recovered += 1
+                logger.info(f"Batch operation {operation_id} reset to pending for re-processing")
+
+            return recovered
+
+        except Exception as e:
+            schema_display = f'"{schema}"' if schema else str(schema)
+            logger.error(f"Failed to recover batch operations for schema {schema_display}: {e}")
+            return 0
 
     async def run(self):
         """

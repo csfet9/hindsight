@@ -10,23 +10,31 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta
-from typing import Literal
+from typing import Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 from ...config import get_config
 from ..llm_wrapper import LLMConfig, OutputTooLongError
 from ..response_models import TokenUsage
+from .entity_labels import (
+    EntityLabelsConfig,
+    build_labels_lookup,
+    build_labels_model,
+    is_label_entity,
+    parse_entity_labels,
+)
 
 
-def _infer_temporal_date(fact_text: str, event_date: datetime) -> str | None:
+def _infer_temporal_date(fact_text: str, event_date: datetime | None) -> str | None:
     """
     Infer a temporal date from fact text when LLM didn't provide occurred_start.
 
     This is a fallback for when the LLM fails to extract temporal information
     from relative time expressions like "last night", "yesterday", etc.
     """
-    import re
+    if event_date is None:
+        return None
 
     fact_lower = fact_text.lower()
 
@@ -205,7 +213,6 @@ class Fact(BaseModel):
     # Optional temporal fields
     occurred_start: str | None = None
     occurred_end: str | None = None
-    mentioned_at: str | None = None
 
     # Optional location field
     where: str | None = Field(
@@ -884,11 +891,9 @@ def _chunk_diff(text: str, max_chars: int) -> list[str]:
 # Uses {extraction_guidelines} placeholder for mode-specific instructions
 _BASE_FACT_EXTRACTION_PROMPT = """Extract SIGNIFICANT facts from text. Be SELECTIVE - only extract facts worth remembering long-term.
 
-LANGUAGE REQUIREMENT: Detect the language of the input text. All extracted facts, entity names, descriptions, and other output MUST be in the SAME language as the input. Do not translate to another language.
+LANGUAGE: MANDATORY — Detect the language of the input text and produce ALL output in that EXACT same language. You are STRICTLY FORBIDDEN from translating or switching to any other language. Every single word of your output must be in the same language as the input. Do NOT output in a different language under any circumstance.
 
-{fact_types_instruction}
-
-{extraction_guidelines}
+{retain_mission_section}{extraction_guidelines}
 
 ══════════════════════════════════════════════════════════════════════════
 FACT FORMAT - BE CONCISE
@@ -927,7 +932,9 @@ TEMPORAL HANDLING
 ══════════════════════════════════════════════════════════════════════════
 
 Use "Event Date" from input as reference for relative dates.
-- "yesterday" relative to Event Date, not today
+- CRITICAL: Convert ALL relative temporal expressions to absolute dates in the fact text itself.
+  "yesterday" → write the resolved date (e.g. "on November 12, 2024"), NOT the word "yesterday"
+  "last night", "this morning", "today", "tonight" → convert to the resolved absolute date
 - For events: set occurred_start AND occurred_end (same for point events)
 - For conversation facts: NO occurred dates
 
@@ -965,7 +972,7 @@ CONSOLIDATE related statements into ONE fact when possible."""
 _CONCISE_EXAMPLES = """
 
 ══════════════════════════════════════════════════════════════════════════
-EXAMPLES
+EXAMPLES (shown in English for illustration; for non-English input, ALL output values MUST be in the input language)
 ══════════════════════════════════════════════════════════════════════════
 
 Example 1 - Selective extraction (Event Date: June 10, 2024):
@@ -993,16 +1000,16 @@ about experiences ARE important to remember, even if they seem small (e.g., how 
 tasted, how someone looked, how loud music was). Extract these if they characterize
 an experience or person."""
 
-# Assembled concise prompt (backward compatible - exact same output as before)
+# Assembled concise prompt
 CONCISE_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
-    fact_types_instruction="{fact_types_instruction}",
+    retain_mission_section="{retain_mission_section}",
     extraction_guidelines=_CONCISE_GUIDELINES,
     examples=_CONCISE_EXAMPLES,
 )
 
 # Custom prompt uses same base but without examples
 CUSTOM_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
-    fact_types_instruction="{fact_types_instruction}",
+    retain_mission_section="{retain_mission_section}",
     extraction_guidelines="{custom_instructions}",
     examples="",  # No examples for custom mode
 )
@@ -1011,10 +1018,7 @@ CUSTOM_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
 # Verbose extraction prompt - detailed, comprehensive facts (legacy mode)
 VERBOSE_FACT_EXTRACTION_PROMPT = """Extract facts from text into structured format with FIVE required dimensions - BE EXTREMELY DETAILED.
 
-LANGUAGE REQUIREMENT: Detect the language of the input text. All extracted facts, entity names, descriptions,
-and other output MUST be in the SAME language as the input. Do not translate to English if the input is in another language.
-
-{fact_types_instruction}
+LANGUAGE: MANDATORY — Detect the language of the input text and produce ALL output in that EXACT same language. You are STRICTLY FORBIDDEN from translating or switching to any other language. Every single word of your output must be in the same language as the input. Do NOT output in a different language under any circumstance.
 
 ══════════════════════════════════════════════════════════════════════════
 FACT FORMAT - ALL FIVE DIMENSIONS REQUIRED - MAXIMUM VERBOSITY
@@ -1139,17 +1143,227 @@ Example: "Lost job → couldn't pay rent → moved apartment"
 - Fact 2: Moved apartment, causal_relations: [{target_index: 1, relation_type: "caused_by"}]"""
 
 
+def _build_labels_prompt_section(labels_cfg: EntityLabelsConfig | list | None, free_form_entities: bool = True) -> str:
+    """Build the entity labels classification section for the extraction prompt."""
+    if labels_cfg is None:
+        return ""
+
+    # Accept raw list for backwards compatibility
+    if isinstance(labels_cfg, list):
+        if not labels_cfg:
+            return ""
+        labels_cfg = parse_entity_labels(labels_cfg)
+        if labels_cfg is None:
+            return ""
+
+    if not labels_cfg.attributes:
+        return ""
+
+    if free_form_entities:
+        entities_instruction = "Classify each fact using the structured 'labels' field below. Continue extracting regular named entities in the 'entities' field."
+    else:
+        entities_instruction = "Classify each fact using the structured 'labels' field below. Do NOT add regular named entities — labels-only mode."
+
+    lines = [
+        "\n\n══════════════════════════════════════════════════════════════════════════",
+        "ENTITY LABELS - CLASSIFICATION ATTRIBUTES",
+        "══════════════════════════════════════════════════════════════════════════",
+        "",
+        entities_instruction,
+        "",
+        "For each fact, fill the 'labels' object. Each field is a label group:",
+        "",
+    ]
+
+    for attr in labels_cfg.attributes:
+        if attr.type == "text":
+            # Free-text: no predefined values — LLM writes any relevant string or null
+            lines.append(f"- {attr.key} (free text or null): {attr.description}")
+        else:
+            mode = "multi-value (list)" if attr.type == "multi-values" else "single value or null"
+            lines.append(f"- {attr.key} ({mode}): {attr.description}")
+            for v in attr.values:
+                desc = f" — {v.description}" if v.description else ""
+                lines.append(f'    • "{v.value}"{desc}')
+        lines.append("")
+
+    lines.append("Only assign labels when clearly applicable. Leave null/empty if the fact does not match.")
+    return "\n".join(lines)
+
+
+def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
+    """
+    Build extraction prompt and response schema based on config.
+
+    When a taxonomy is configured, dynamically builds a Pydantic model with a
+    typed `taxonomy_entities` field using an Enum built from valid taxonomy values.
+    This enables JSON schema enforcement for structured outputs.
+
+    Returns:
+        Tuple of (prompt, response_schema)
+    """
+    extraction_mode = config.retain_extraction_mode
+    extract_causal_links = config.retain_extract_causal_links
+
+    # Build retain_mission section if set - injected before the mode-specific guidelines
+    retain_mission = getattr(config, "retain_mission", None)
+    if retain_mission:
+        retain_mission_section = (
+            f"══════════════════════════════════════════════════════════════════════════\n"
+            f"FOCUS — What to retain for this bank\n"
+            f"══════════════════════════════════════════════════════════════════════════\n\n"
+            f"{retain_mission}\n\n"
+        )
+    else:
+        retain_mission_section = ""
+
+    # Select base prompt based on extraction mode
+    if extraction_mode == "custom":
+        if not config.retain_custom_instructions:
+            base_prompt = CONCISE_FACT_EXTRACTION_PROMPT
+            prompt = base_prompt.format(
+                retain_mission_section=retain_mission_section,
+            )
+        else:
+            base_prompt = CUSTOM_FACT_EXTRACTION_PROMPT
+            prompt = base_prompt.format(
+                retain_mission_section=retain_mission_section,
+                custom_instructions=config.retain_custom_instructions,
+            )
+    elif extraction_mode == "verbose":
+        prompt = VERBOSE_FACT_EXTRACTION_PROMPT
+    else:
+        base_prompt = CONCISE_FACT_EXTRACTION_PROMPT
+        prompt = base_prompt.format(
+            retain_mission_section=retain_mission_section,
+        )
+
+    # Add causal relationships section if enabled
+    if extract_causal_links:
+        prompt = prompt + CAUSAL_RELATIONSHIPS_SECTION
+        base_fact_class = ExtractedFactVerbose if extraction_mode == "verbose" else ExtractedFact
+        base_response_class = FactExtractionResponseVerbose if extraction_mode == "verbose" else FactExtractionResponse
+    else:
+        base_fact_class = ExtractedFactNoCausal
+        base_response_class = FactExtractionResponseNoCausal
+
+    # Add entity labels section if configured and build dynamic schema
+    entity_labels_raw = getattr(config, "entity_labels", None)
+    labels_cfg = parse_entity_labels(entity_labels_raw)
+    free_form_entities = getattr(config, "entities_allow_free_form", True)
+    labels_section = _build_labels_prompt_section(labels_cfg, free_form_entities)
+    if labels_section:
+        prompt = prompt + labels_section
+
+    response_schema = base_response_class
+
+    if labels_cfg and labels_cfg.attributes:
+        LabelsModel = build_labels_model(labels_cfg)
+        if LabelsModel is not None:
+            dynamic_fields: dict = {
+                "labels": (
+                    LabelsModel,
+                    Field(
+                        description="Classification labels for this fact. Fill each applicable field; leave others null/empty."
+                    ),
+                )
+            }
+            if not free_form_entities:
+                dynamic_fields["entities"] = (
+                    list[Entity] | None,
+                    Field(default=None, description="Leave empty — labels-only mode"),
+                )
+            # Inherit parent's required fields and add 'labels' so it appears in the JSON schema
+            # required array (the base class json_schema_extra overrides required entirely)
+            base_extra = base_fact_class.model_config.get("json_schema_extra")
+            base_required = cast(dict, base_extra).get("required", []) if isinstance(base_extra, dict) else []
+            DynamicFact = create_model(
+                "LabelsFact",
+                __base__=base_fact_class,
+                __config__=ConfigDict(
+                    json_schema_mode="validation",
+                    json_schema_extra={"required": [*base_required, "labels"]},
+                ),
+                **dynamic_fields,
+            )
+            DynamicResponse = create_model("LabelsResponse", facts=(list[DynamicFact], ...))  # type: ignore[valid-type]
+            response_schema = DynamicResponse
+
+    return prompt, response_schema
+
+
+def _build_user_message(
+    chunk: str,
+    chunk_index: int,
+    total_chunks: int,
+    event_date: datetime | None,
+    context: str,
+    metadata: dict[str, str] | None = None,
+) -> str:
+    """Build user message for fact extraction."""
+    from .orchestrator import parse_datetime_flexible
+
+    sanitized_chunk = _sanitize_text(chunk)
+    sanitized_context = _sanitize_text(context) if context else "none"
+
+    if event_date is not None:
+        event_date = parse_datetime_flexible(event_date)
+        event_date_str = f"{event_date.strftime('%A, %B %d, %Y')} ({event_date.isoformat()})"
+    else:
+        event_date_str = "Unknown"
+
+    metadata_section = ""
+    if metadata:
+        metadata_lines = "\n".join(f"  {k}: {v}" for k, v in metadata.items())
+        metadata_section = f"\nMetadata:\n{metadata_lines}"
+
+    return f"""Extract facts from the following text chunk.
+
+Chunk: {chunk_index + 1}/{total_chunks}
+Event Date: {event_date_str}
+Context: {sanitized_context}{metadata_section}
+
+Text:
+{sanitized_chunk}"""
+
+
+def _build_request_body(llm_config, config, prompt: str, user_message: str, response_schema: type) -> dict:
+    """Build request body for LLM API call."""
+    request_body = {
+        "model": llm_config.model,
+        "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": user_message}],
+        "temperature": 0.1,
+    }
+
+    # Add max_completion_tokens if configured
+    if config.retain_max_completion_tokens:
+        request_body["max_completion_tokens"] = config.retain_max_completion_tokens
+
+    # Add service_tier for OpenAI Flex Processing
+    if llm_config.provider == "openai" and llm_config._provider_impl.openai_service_tier:
+        request_body["service_tier"] = llm_config._provider_impl.openai_service_tier
+
+    # Add response_format (JSON schema)
+    if hasattr(response_schema, "model_json_schema"):
+        schema = response_schema.model_json_schema()
+        request_body["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "facts", "schema": schema},
+        }
+
+    return request_body
+
+
 async def _extract_facts_from_chunk(
     chunk: str,
     chunk_index: int,
     total_chunks: int,
-    event_date: datetime,
+    event_date: datetime | None,
     context: str,
     llm_config: "LLMConfig",
     config,
     agent_name: str = None,
-    extract_opinions: bool = False,
-    content_type: str = "prose",
+    metadata: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, str]], TokenUsage]:
     """
     Extract facts from a single chunk (internal helper for parallel processing).
@@ -1174,92 +1388,26 @@ async def _extract_facts_from_chunk(
 
     logger = logging.getLogger(__name__)
 
-    # Determine which fact types to extract based on the flag
-    # Note: We use "assistant" in the prompt but convert to "bank" for storage
-    if extract_opinions:
-        fact_types_instruction = "Extract ONLY 'opinion' type facts (formed opinions, beliefs, and perspectives). DO NOT extract 'world' or 'assistant' facts."
-    else:
-        fact_types_instruction = (
-            "Extract ONLY 'world' and 'assistant' type facts. DO NOT extract opinions - those are extracted separately."
-        )
-
-    # Use code-specific prompt for code and diff content
-    use_code_prompt = content_type in ("code", "diff")
+    # Build prompt and schema using helper function
+    prompt, response_schema = _build_extraction_prompt_and_schema(config)
 
     # Check config for extraction mode and causal link extraction
     extraction_mode = config.retain_extraction_mode
     extract_causal_links = config.retain_extract_causal_links
 
-    # Select base prompt based on content type and extraction mode
-    if use_code_prompt:
-        # Code/diff content uses a dedicated extraction prompt
-        prompt = f"""{CODE_EXTRACTION_PROMPT}
-
-{fact_types_instruction}"""
-    elif extraction_mode == "custom":
-        # Custom mode: inject user-provided guidelines
-        if not config.retain_custom_instructions:
-            logger.warning(
-                "extraction_mode='custom' but HINDSIGHT_API_RETAIN_CUSTOM_INSTRUCTIONS not set. "
-                "Falling back to 'concise' mode."
-            )
-            base_prompt = CONCISE_FACT_EXTRACTION_PROMPT
-            prompt = base_prompt.format(fact_types_instruction=fact_types_instruction)
-        else:
-            base_prompt = CUSTOM_FACT_EXTRACTION_PROMPT
-            prompt = base_prompt.format(
-                fact_types_instruction=fact_types_instruction,
-                custom_instructions=config.retain_custom_instructions,
-            )
-    elif extraction_mode == "verbose":
-        base_prompt = VERBOSE_FACT_EXTRACTION_PROMPT
-        prompt = base_prompt.format(fact_types_instruction=fact_types_instruction)
-    else:
-        base_prompt = CONCISE_FACT_EXTRACTION_PROMPT
-        prompt = base_prompt.format(fact_types_instruction=fact_types_instruction)
-
-    # Build the full prompt with or without causal relationships section
-    # Select appropriate response schema based on extraction mode and causal links
-    if extract_causal_links:
-        prompt = prompt + CAUSAL_RELATIONSHIPS_SECTION
-        if extraction_mode == "verbose":
-            response_schema = FactExtractionResponseVerbose
-        else:
-            response_schema = FactExtractionResponse
-    else:
-        response_schema = FactExtractionResponseNoCausal
+    # Build user message using helper function
+    user_message = _build_user_message(chunk, chunk_index, total_chunks, event_date, context, metadata)
 
     # Retry logic for JSON validation errors
-    max_retries = 2
-    last_error = None
-
-    # Sanitize input text to prevent Unicode encoding errors (e.g., unpaired surrogates)
-    sanitized_chunk = _sanitize_text(chunk)
-    sanitized_context = _sanitize_text(context) if context else "none"
-
-    # Build user message with metadata and chunk content in a clear format
-    # Format event_date with day of week for better temporal reasoning
-    # Handle both datetime objects and ISO string formats (from deserialized async tasks)
-    from .orchestrator import parse_datetime_flexible
-
-    event_date = parse_datetime_flexible(event_date)
-    event_date_formatted = event_date.strftime("%A, %B %d, %Y")  # e.g., "Monday, June 10, 2024"
-    user_message = f"""Extract facts from the following text chunk.
-
-Chunk: {chunk_index + 1}/{total_chunks}
-Event Date: {event_date_formatted} ({event_date.isoformat()})
-Context: {sanitized_context}
-
-Text:
-{sanitized_chunk}"""
+    # Use retain-specific overrides if set, otherwise fall back to global LLM config
+    llm_max_retries = (
+        config.retain_llm_max_retries if config.retain_llm_max_retries is not None else config.llm_max_retries
+    )
+    last_error: Exception | None = None
 
     usage = TokenUsage()  # Track cumulative usage across retries
-    for attempt in range(max_retries):
+    for attempt in range(llm_max_retries):
         try:
-            # Use retain-specific overrides if set, otherwise fall back to global LLM config
-            max_retries = (
-                config.retain_llm_max_retries if config.retain_llm_max_retries is not None else config.llm_max_retries
-            )
             initial_backoff = (
                 config.retain_llm_initial_backoff
                 if config.retain_llm_initial_backoff is not None
@@ -1275,7 +1423,7 @@ Text:
                 scope="retain_extract_facts",
                 temperature=0.1,
                 max_completion_tokens=config.retain_max_completion_tokens,
-                max_retries=max_retries,
+                max_retries=llm_max_retries,
                 initial_backoff=initial_backoff,
                 max_backoff=max_backoff,
                 skip_validation=True,  # Get raw JSON, we'll validate leniently
@@ -1289,14 +1437,14 @@ Text:
 
             # Handle malformed LLM responses
             if not isinstance(extraction_response_json, dict):
-                if attempt < max_retries - 1:
+                if attempt < llm_max_retries - 1:
                     logger.warning(
-                        f"LLM returned non-dict JSON on attempt {attempt + 1}/{max_retries}: {type(extraction_response_json).__name__}. Retrying..."
+                        f"LLM returned non-dict JSON on attempt {attempt + 1}/{llm_max_retries}: {type(extraction_response_json).__name__}. Retrying..."
                     )
                     continue
                 else:
                     logger.warning(
-                        f"LLM returned non-dict JSON after {max_retries} attempts: {type(extraction_response_json).__name__}. "
+                        f"LLM returned non-dict JSON after {llm_max_retries} attempts: {type(extraction_response_json).__name__}. "
                         f"Raw: {str(extraction_response_json)[:500]}"
                     )
                     return [], usage
@@ -1406,9 +1554,9 @@ Text:
                 # Add entities if present (validate as Entity objects)
                 # LLM sometimes returns strings instead of {"text": "..."} format
                 entities = get_value("entities")
+                validated_entities = []
                 if entities:
                     # Validate and normalize each entity
-                    validated_entities = []
                     for ent in entities:
                         if isinstance(ent, str):
                             # Normalize string to Entity object
@@ -1418,8 +1566,48 @@ Text:
                                 validated_entities.append(Entity.model_validate(ent))
                             except Exception as e:
                                 logger.warning(f"Invalid entity {ent}: {e}")
-                    if validated_entities:
-                        fact_data["entities"] = validated_entities
+
+                # Post-process label entities from structured labels object
+                entity_labels_raw = getattr(config, "entity_labels", None)
+                labels_cfg = parse_entity_labels(entity_labels_raw)
+                free_form_entities = getattr(config, "entities_allow_free_form", True)
+                if labels_cfg and labels_cfg.attributes:
+                    labels_lookup = build_labels_lookup(labels_cfg)
+                    labels_data = llm_fact.get("labels") or {}
+                    if isinstance(labels_data, dict):
+                        existing_texts_lower = {e.text.lower() for e in validated_entities}
+                        for group in labels_cfg.attributes:
+                            value = labels_data.get(group.key)
+                            if not value:
+                                continue
+                            values_list = value if isinstance(value, list) else [value]
+                            for v in values_list:
+                                if not isinstance(v, str) or not v.strip() or v.lower() in ("none", "null", "n/a"):
+                                    continue
+                                label_str = f"{group.key}:{v.strip()}"
+                                if group.type == "text":
+                                    if label_str.lower() not in existing_texts_lower:
+                                        validated_entities.append(Entity(text=label_str))
+                                        existing_texts_lower.add(label_str.lower())
+                                elif (
+                                    label_str.lower() in labels_lookup and label_str.lower() not in existing_texts_lower
+                                ):
+                                    validated_entities.append(Entity(text=label_str))
+                                    existing_texts_lower.add(label_str.lower())
+                                else:
+                                    logger.warning(f"Label '{label_str}' not in valid label values, skipping")
+
+                    # In labels-only mode, keep only label entities
+                    if not free_form_entities:
+                        validated_entities = [
+                            e for e in validated_entities if is_label_entity(e.text, labels_cfg, labels_lookup)
+                        ]
+                elif not free_form_entities:
+                    # No labels but free_form disabled: clear all entities
+                    validated_entities = []
+
+                if validated_entities:
+                    fact_data["entities"] = validated_entities
 
                 # Add per-fact causal relations (only if enabled in config)
                 if extract_causal_links:
@@ -1458,8 +1646,9 @@ Text:
                     if validated_relations:
                         fact_data["causal_relations"] = validated_relations
 
-                # Always set mentioned_at to the event_date (when the conversation/document occurred)
-                fact_data["mentioned_at"] = event_date.isoformat()
+                # Set mentioned_at to the event_date (when the conversation/document occurred),
+                # or None when the caller opted into no timestamp.
+                fact_data["mentioned_at"] = event_date.isoformat() if event_date is not None else None
 
                 # Build Fact model instance
                 try:
@@ -1471,9 +1660,9 @@ Text:
                     continue
 
             # If we got malformed facts and haven't exhausted retries, try again
-            if has_malformed_facts and len(chunk_facts) < len(raw_facts) * 0.8 and attempt < max_retries - 1:
+            if has_malformed_facts and len(chunk_facts) < len(raw_facts) * 0.8 and attempt < llm_max_retries - 1:
                 logger.warning(
-                    f"Got {len(raw_facts) - len(chunk_facts)} malformed facts out of {len(raw_facts)} on attempt {attempt + 1}/{max_retries}. Retrying..."
+                    f"Got {len(raw_facts) - len(chunk_facts)} malformed facts out of {len(raw_facts)} on attempt {attempt + 1}/{llm_max_retries}. Retrying..."
                 )
                 continue
 
@@ -1506,29 +1695,30 @@ Text:
 
             if "json_validate_failed" in str(e):
                 logger.warning(
-                    f"          [1.3.{chunk_index + 1}] Attempt {attempt + 1}/{max_retries} failed with JSON validation error: {e}"
+                    f"          [1.3.{chunk_index + 1}] Attempt {attempt + 1}/{llm_max_retries} failed with JSON validation error: {e}"
                 )
-                if attempt < max_retries - 1:
+                if attempt < llm_max_retries - 1:
                     logger.info(f"          [1.3.{chunk_index + 1}] Retrying...")
                     continue
             # If it's not a JSON validation error or we're out of retries, re-raise
             raise
 
-    # If we exhausted all retries, raise the last error
-    raise last_error
+    # If we exhausted all retries, raise the last error or a descriptive fallback
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Fact extraction failed after {llm_max_retries} attempts: LLM did not return valid JSON")
 
 
 async def _extract_facts_with_auto_split(
     chunk: str,
     chunk_index: int,
     total_chunks: int,
-    event_date: datetime,
+    event_date: datetime | None,
     context: str,
     llm_config: LLMConfig,
     config,
     agent_name: str = None,
-    extract_opinions: bool = False,
-    content_type: str = "prose",
+    metadata: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, str]], TokenUsage]:
     """
     Extract facts from a chunk with automatic splitting if output exceeds token limits.
@@ -1545,8 +1735,7 @@ async def _extract_facts_with_auto_split(
         llm_config: LLM configuration to use
         config: Resolved HindsightConfig for this bank
         agent_name: Optional agent name (memory owner)
-        extract_opinions: If True, extract ONLY opinions. If False, extract world and agent facts (no opinions)
-        content_type: "prose", "code", or "diff" - affects extraction prompt
+        metadata: Optional document metadata key-value pairs
 
     Returns:
         Tuple of (facts list, token usage) extracted from the chunk (possibly from sub-chunks)
@@ -1566,8 +1755,7 @@ async def _extract_facts_with_auto_split(
             llm_config=llm_config,
             config=config,
             agent_name=agent_name,
-            extract_opinions=extract_opinions,
-            content_type=content_type,
+            metadata=metadata,
         )
     except OutputTooLongError:
         # Output exceeded token limits - split the chunk in half and retry
@@ -1613,8 +1801,7 @@ async def _extract_facts_with_auto_split(
                 llm_config=llm_config,
                 config=config,
                 agent_name=agent_name,
-                extract_opinions=extract_opinions,
-                content_type=content_type,
+                metadata=metadata,
             ),
             _extract_facts_with_auto_split(
                 chunk=second_half,
@@ -1625,8 +1812,7 @@ async def _extract_facts_with_auto_split(
                 llm_config=llm_config,
                 config=config,
                 agent_name=agent_name,
-                extract_opinions=extract_opinions,
-                content_type=content_type,
+                metadata=metadata,
             ),
         ]
 
@@ -1646,13 +1832,12 @@ async def _extract_facts_with_auto_split(
 
 async def extract_facts_from_text(
     text: str,
-    event_date: datetime,
+    event_date: datetime | None,
     llm_config: LLMConfig,
     agent_name: str,
     config,
     context: str = "",
-    extract_opinions: bool = False,
-    content_type: str = "auto",
+    metadata: dict[str, str] | None = None,
 ) -> tuple[list[Fact], list[tuple[str, int]], TokenUsage]:
     """
     Extract semantic facts from conversational or narrative text using LLM.
@@ -1670,6 +1855,7 @@ async def extract_facts_from_text(
         agent_name: Agent name (memory owner)
         config: Resolved HindsightConfig for this bank
         context: Context about the conversation/document
+        metadata: Optional document metadata key-value pairs
 
     Returns:
         Tuple of (facts, chunks, usage) where:
@@ -1697,8 +1883,7 @@ async def extract_facts_from_text(
             llm_config=llm_config,
             config=config,
             agent_name=agent_name,
-            extract_opinions=extract_opinions,
-            content_type=actual_content_type,
+            metadata=metadata,
         )
         for i, chunk in enumerate(chunks)
     ]
@@ -1725,12 +1910,466 @@ from .types import ExtractedFact as ExtractedFactType
 
 logger = logging.getLogger(__name__)
 
-# Each fact gets 10 seconds offset to preserve ordering within a document
-SECONDS_PER_FACT = 10
+# Each fact gets 10ms offset to preserve ordering within a document
+SECONDS_PER_FACT = 0.01
+
+
+async def extract_facts_from_contents_batch_api(
+    contents: list[RetainContent],
+    llm_config,
+    agent_name: str,
+    config,
+    pool=None,
+    operation_id: str | None = None,
+    schema: str | None = None,
+) -> tuple[list[ExtractedFactType], list[ChunkMetadata], TokenUsage]:
+    """
+    Extract facts using LLM Batch API (OpenAI/Groq).
+
+    Submits all chunks as a single batch, polls until complete, then processes results.
+    Only called when config.retain_batch_enabled=True.
+
+    Args:
+        contents: List of RetainContent objects to process
+        llm_config: LLM configuration with batch API support
+        agent_name: Name of the agent
+        config: Resolved HindsightConfig for this bank
+        pool: Database connection pool (for storing batch state)
+        operation_id: Async operation ID (for crash recovery)
+        schema: Database schema (for multi-tenant support)
+
+    Returns:
+        Tuple of (extracted_facts, chunks_metadata, usage)
+    """
+    if not contents:
+        return [], [], TokenUsage()
+
+    logger.info(f"Using Batch API for fact extraction ({len(contents)} contents)")
+
+    # Check config for extraction mode and causal link extraction (used throughout)
+    extraction_mode = config.retain_extraction_mode
+    extract_causal_links = config.retain_extract_causal_links
+
+    # Check if provider supports batch API
+    if not await llm_config._provider_impl.supports_batch_api():
+        logger.warning(f"Batch API not supported for provider {llm_config.provider}, falling back to sync mode")
+        return await extract_facts_from_contents(contents, llm_config, agent_name, config, pool, operation_id, schema)
+
+    # Check if we're resuming an existing batch (crash recovery)
+    batch_id = None
+    if operation_id and pool:
+        from ..task_backend import fq_table
+
+        table = fq_table("async_operations", schema)
+        row = await pool.fetchrow(
+            f"SELECT result_metadata FROM {table} WHERE operation_id = $1",
+            operation_id,
+        )
+
+        if row and row["result_metadata"]:
+            metadata = row["result_metadata"]
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            batch_id = metadata.get("batch_id")
+
+            if batch_id:
+                logger.info(f"Resuming existing batch: batch_id={batch_id} (crash recovery)")
+
+    # Step 1: Chunk all contents and build batch requests (skip if resuming)
+    all_chunks_info = []  # List of (chunk_text, content_index, chunk_index_in_content, event_date, context)
+    batch_requests = []
+
+    # Build prompt and schema once (same for all chunks)
+    prompt, response_schema = _build_extraction_prompt_and_schema(config)
+
+    for content_index, item in enumerate(contents):
+        chunks = chunk_text(item.content, max_chars=config.retain_chunk_size)
+
+        for chunk_index_in_content, chunk in enumerate(chunks):
+            all_chunks_info.append((chunk, content_index, chunk_index_in_content, item.event_date, item.context))
+
+            # Build batch request for this chunk
+            custom_id = f"chunk_{len(all_chunks_info) - 1}"  # Global chunk index
+
+            # Build user message using helper function
+            user_message = _build_user_message(
+                chunk, chunk_index_in_content, len(chunks), item.event_date, item.context, item.metadata or None
+            )
+
+            # Build request body using helper function
+            request_body = _build_request_body(llm_config, config, prompt, user_message, response_schema)
+
+            batch_requests.append(
+                {"custom_id": custom_id, "method": "POST", "url": "/v1/chat/completions", "body": request_body}
+            )
+
+    if not batch_requests and not batch_id:  # No requests and not resuming
+        return [], [], TokenUsage()
+
+    # Step 2: Submit batch (skip if resuming)
+    if not batch_id:
+        logger.info(f"Submitting batch with {len(batch_requests)} chunk requests")
+
+        batch_metadata = await llm_config._provider_impl.submit_batch(batch_requests)
+        batch_id = batch_metadata["batch_id"]
+
+        logger.info(f"Batch submitted: {batch_id}, polling every {config.retain_batch_poll_interval_seconds}s")
+
+        # CRITICAL: Store minimal batch state in operation metadata for crash recovery
+        # This allows resuming polling if worker restarts
+        if operation_id and pool:
+            batch_state = {
+                "batch_id": batch_id,
+                "batch_provider": llm_config.provider,
+                "chunk_count": len(batch_requests),
+            }
+
+            # Update operation result_metadata
+            from ..task_backend import fq_table
+
+            table = fq_table("async_operations", schema)
+            await pool.execute(
+                f"""
+                UPDATE {table}
+                SET result_metadata = result_metadata || $1::jsonb, updated_at = now()
+                WHERE operation_id = $2
+                """,
+                json.dumps(batch_state),
+                operation_id,
+            )
+            logger.info(f"Stored batch state for operation {operation_id} (crash recovery enabled)")
+    else:
+        logger.info(f"Resuming polling for existing batch: {batch_id}")
+
+    # Step 3: Poll until complete
+    import time
+
+    start_time = time.time()
+    while True:
+        status_info = await llm_config._provider_impl.get_batch_status(batch_id)
+        status = status_info["status"]
+
+        elapsed = time.time() - start_time
+        logger.info(
+            f"Batch {batch_id}: status={status}, "
+            f"completed={status_info['request_counts']['completed']}/{status_info['request_counts']['total']}, "
+            f"elapsed={elapsed:.0f}s"
+        )
+
+        if status == "completed":
+            break
+        elif status in ("failed", "expired", "cancelled"):
+            error_msg = status_info.get("errors", "Unknown error")
+            raise RuntimeError(f"Batch {batch_id} failed with status {status}: {error_msg}")
+
+        # Wait before polling again
+        await asyncio.sleep(config.retain_batch_poll_interval_seconds)
+
+    logger.info(f"Batch {batch_id} completed in {elapsed:.0f}s, retrieving results")
+
+    # Step 4: Retrieve results
+    batch_results = await llm_config._provider_impl.retrieve_batch_results(batch_id)
+
+    # Map results by custom_id
+    results_by_id = {result["custom_id"]: result for result in batch_results}
+
+    # Step 5: Parse results into facts (same as sync mode)
+    all_facts_from_llm = []
+    chunks_metadata = []
+    total_usage = TokenUsage()
+
+    for chunk_idx, (chunk_content, content_index, chunk_index_in_content, event_date, context) in enumerate(
+        all_chunks_info
+    ):
+        custom_id = f"chunk_{chunk_idx}"
+        result = results_by_id.get(custom_id)
+
+        if not result:
+            logger.warning(f"Missing result for {custom_id}, skipping")
+            chunks_metadata.append(
+                ChunkMetadata(
+                    chunk_text=chunk_content, fact_count=0, content_index=content_index, chunk_index=chunk_idx
+                )
+            )
+            continue
+
+        # Check for errors
+        if result.get("error"):
+            logger.error(f"Error in {custom_id}: {result['error']}")
+            chunks_metadata.append(
+                ChunkMetadata(
+                    chunk_text=chunk_content, fact_count=0, content_index=content_index, chunk_index=chunk_idx
+                )
+            )
+            continue
+
+        # Extract response
+        response_body = result.get("response", {}).get("body", {})
+        choices = response_body.get("choices", [])
+
+        if not choices:
+            logger.warning(f"No choices in response for {custom_id}")
+            chunks_metadata.append(
+                ChunkMetadata(
+                    chunk_text=chunk_content, fact_count=0, content_index=content_index, chunk_index=chunk_idx
+                )
+            )
+            continue
+
+        # Parse JSON content
+        message = choices[0].get("message", {})
+        content_str = message.get("content", "{}")
+
+        try:
+            extraction_response_json = json.loads(content_str)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON for {custom_id}: {e}")
+            chunks_metadata.append(
+                ChunkMetadata(
+                    chunk_text=chunk_content, fact_count=0, content_index=content_index, chunk_index=chunk_idx
+                )
+            )
+            continue
+
+        # Parse facts (reuse existing logic from _extract_facts_from_chunk)
+        raw_facts = extraction_response_json.get("facts", [])
+        chunk_facts = []
+
+        for i, llm_fact in enumerate(raw_facts):
+            if not isinstance(llm_fact, dict):
+                continue
+
+            def get_value(field_name):
+                value = llm_fact.get(field_name)
+                if value and value != "" and value != [] and value != {} and str(value).upper() != "N/A":
+                    return value
+                return None
+
+            what = get_value("what")
+            if not what:
+                what = get_value("factual_core")
+            if not what:
+                continue
+
+            when = get_value("when")
+            who = get_value("who")
+            why = get_value("why")
+
+            # Critical field: fact_type
+            original_fact_type = llm_fact.get("fact_type")
+            fact_type = original_fact_type
+
+            # Convert "assistant" → "experience"
+            if fact_type == "assistant":
+                fact_type = "experience"
+
+            # Validate fact_type
+            if fact_type not in ["world", "experience", "opinion"]:
+                fact_kind = llm_fact.get("fact_kind")
+                if fact_kind == "assistant":
+                    fact_type = "experience"
+                elif fact_kind in ["world", "experience", "opinion"]:
+                    fact_type = fact_kind
+                else:
+                    fact_type = "world"
+
+            # Build combined fact text
+            combined_parts = [what]
+            if when:
+                combined_parts.append(f"When: {when}")
+            if who:
+                combined_parts.append(f"Involving: {who}")
+            if why:
+                combined_parts.append(why)
+            combined_text = " | ".join(combined_parts)
+
+            # Temporal fields
+            fact_data = {}
+            fact_kind = llm_fact.get("fact_kind", "conversation")
+            if fact_kind not in ["conversation", "event", "other"]:
+                fact_kind = "conversation"
+
+            if fact_kind == "event":
+                occurred_start = get_value("occurred_start")
+                occurred_end = get_value("occurred_end")
+
+                if not occurred_start:
+                    fact_data["occurred_start"] = _infer_temporal_date(combined_text, event_date)
+                else:
+                    fact_data["occurred_start"] = occurred_start
+
+                if occurred_end:
+                    fact_data["occurred_end"] = occurred_end
+                elif fact_data.get("occurred_start"):
+                    fact_data["occurred_end"] = fact_data["occurred_start"]
+
+            # Entities
+            entities = get_value("entities")
+            validated_entities = []
+            if entities:
+                for ent in entities:
+                    if isinstance(ent, str):
+                        validated_entities.append(Entity(text=ent))
+                    elif isinstance(ent, dict) and "text" in ent:
+                        try:
+                            validated_entities.append(Entity.model_validate(ent))
+                        except Exception:
+                            pass
+
+            # Post-process label entities from structured labels object
+            entity_labels_raw = getattr(config, "entity_labels", None)
+            labels_cfg_batch = parse_entity_labels(entity_labels_raw)
+            free_form_entities_batch = getattr(config, "entities_allow_free_form", True)
+            if labels_cfg_batch and labels_cfg_batch.attributes:
+                labels_lookup_batch = build_labels_lookup(labels_cfg_batch)
+                labels_data = llm_fact.get("labels") or {}
+                if isinstance(labels_data, dict):
+                    existing_texts_lower = {e.text.lower() for e in validated_entities}
+                    for group in labels_cfg_batch.attributes:
+                        value = labels_data.get(group.key)
+                        if not value:
+                            continue
+                        values_list = value if isinstance(value, list) else [value]
+                        for v in values_list:
+                            if not isinstance(v, str) or not v.strip() or v.lower() in ("none", "null", "n/a"):
+                                continue
+                            label_str = f"{group.key}:{v.strip()}"
+                            if group.type == "text":
+                                if label_str.lower() not in existing_texts_lower:
+                                    validated_entities.append(Entity(text=label_str))
+                                    existing_texts_lower.add(label_str.lower())
+                            elif (
+                                label_str.lower() in labels_lookup_batch
+                                and label_str.lower() not in existing_texts_lower
+                            ):
+                                validated_entities.append(Entity(text=label_str))
+                                existing_texts_lower.add(label_str.lower())
+
+                if not free_form_entities_batch:
+                    validated_entities = [
+                        e for e in validated_entities if is_label_entity(e.text, labels_cfg_batch, labels_lookup_batch)
+                    ]
+            elif not free_form_entities_batch:
+                validated_entities = []
+
+            if validated_entities:
+                fact_data["entities"] = validated_entities
+
+            # Causal relations
+            if extract_causal_links:
+                validated_relations = []
+                causal_relations_raw = get_value("causal_relations")
+                if causal_relations_raw:
+                    for rel in causal_relations_raw:
+                        if not isinstance(rel, dict):
+                            continue
+                        target_idx = rel.get("target_index")
+                        relation_type = rel.get("relation_type")
+                        strength = rel.get("strength", 1.0)
+
+                        if target_idx is None or relation_type is None:
+                            continue
+                        if target_idx < 0 or target_idx >= i:
+                            continue
+
+                        try:
+                            validated_relations.append(
+                                CausalRelation(
+                                    target_fact_index=target_idx, relation_type=relation_type, strength=strength
+                                )
+                            )
+                        except Exception:
+                            pass
+
+                if validated_relations:
+                    fact_data["causal_relations"] = validated_relations
+
+            # Set mentioned_at to the event_date (when the conversation/document occurred),
+            # or None when the caller opted into no timestamp.
+            fact_data["mentioned_at"] = event_date.isoformat() if event_date is not None else None
+
+            try:
+                fact = Fact(fact=combined_text, fact_type=fact_type, **fact_data)
+                chunk_facts.append(fact)
+            except Exception as e:
+                logger.error(f"Failed to create Fact model for fact {i}: {e}")
+                continue
+
+        all_facts_from_llm.extend(chunk_facts)
+        chunks_metadata.append(
+            ChunkMetadata(
+                chunk_text=chunk_content,
+                fact_count=len(chunk_facts),
+                content_index=content_index,
+                chunk_index=chunk_idx,
+            )
+        )
+
+        # Track token usage
+        usage_data = response_body.get("usage", {})
+        if usage_data:
+            total_usage = total_usage + TokenUsage(
+                input_tokens=usage_data.get("prompt_tokens", 0),
+                output_tokens=usage_data.get("completion_tokens", 0),
+                total_tokens=usage_data.get("total_tokens", 0),
+            )
+
+    # Step 6: Convert to ExtractedFact objects with proper chunk mapping
+    # Group facts by chunk
+    facts_by_chunk = []  # List of (chunk_metadata, [facts])
+    fact_start_idx = 0
+
+    for chunk_meta in chunks_metadata:
+        chunk_facts = all_facts_from_llm[fact_start_idx : fact_start_idx + chunk_meta.fact_count]
+        facts_by_chunk.append((chunk_meta, chunk_facts))
+        fact_start_idx += chunk_meta.fact_count
+
+    # Now convert to ExtractedFactType
+    extracted_facts = []
+    global_fact_idx = 0
+
+    for chunk_meta, chunk_facts in facts_by_chunk:
+        content = contents[chunk_meta.content_index]
+
+        for fact_from_llm in chunk_facts:
+            extracted_fact = ExtractedFactType(
+                fact_text=fact_from_llm.fact,
+                fact_type=fact_from_llm.fact_type,
+                entities=[e.text for e in (fact_from_llm.entities or [])],
+                occurred_start=_parse_datetime(fact_from_llm.occurred_start) if fact_from_llm.occurred_start else None,
+                occurred_end=_parse_datetime(fact_from_llm.occurred_end) if fact_from_llm.occurred_end else None,
+                causal_relations=_convert_causal_relations(fact_from_llm.causal_relations or [], global_fact_idx),
+                content_index=chunk_meta.content_index,
+                chunk_index=chunk_meta.chunk_index,
+                context=content.context,
+                mentioned_at=content.event_date,
+                metadata=content.metadata,
+                tags=content.tags,
+                observation_scopes=content.observation_scopes,
+            )
+
+            extracted_facts.append(extracted_fact)
+            global_fact_idx += 1
+
+    # Step 7: Add temporal offsets
+    _add_temporal_offsets(extracted_facts, contents)
+
+    # Step 8: Auto-tag facts from label groups with tag=True
+    _inject_label_tags(extracted_facts, config)
+
+    logger.info(f"Batch API extracted {len(extracted_facts)} facts from {len(all_chunks_info)} chunks")
+
+    return extracted_facts, chunks_metadata, total_usage
 
 
 async def extract_facts_from_contents(
-    contents: list[RetainContent], llm_config, agent_name: str, config
+    contents: list[RetainContent],
+    llm_config,
+    agent_name: str,
+    config,
+    pool=None,
+    operation_id: str | None = None,
+    schema: str | None = None,
 ) -> tuple[list[ExtractedFactType], list[ChunkMetadata], TokenUsage]:
     """
     Extract facts from multiple content items in parallel.
@@ -1741,17 +2380,28 @@ async def extract_facts_from_contents(
     3. Adds time offsets to preserve fact ordering within each content
     4. Returns typed ExtractedFact and ChunkMetadata objects
 
+    Routes to batch API mode if config.retain_batch_enabled=True.
+
     Args:
         contents: List of RetainContent objects to process
         llm_config: LLM configuration for fact extraction
         agent_name: Name of the agent (for agent-related fact detection)
         config: Resolved HindsightConfig for this bank
+        pool: Database connection pool (passed to batch API for state storage)
+        operation_id: Async operation ID (passed to batch API for crash recovery)
+        schema: Database schema (passed to batch API for multi-tenant support)
 
     Returns:
         Tuple of (extracted_facts, chunks_metadata, usage)
     """
     if not contents:
         return [], [], TokenUsage()
+
+    # Route to batch API if enabled
+    if config.retain_batch_enabled:
+        return await extract_facts_from_contents_batch_api(
+            contents, llm_config, agent_name, config, pool, operation_id, schema
+        )
 
     # Step 1: Create parallel fact extraction tasks
     fact_extraction_tasks = []
@@ -1765,6 +2415,7 @@ async def extract_facts_from_contents(
             llm_config=llm_config,
             agent_name=agent_name,
             config=config,
+            metadata=item.metadata or None,
         )
         fact_extraction_tasks.append(task)
 
@@ -1828,6 +2479,7 @@ async def extract_facts_from_contents(
                         mentioned_at=content.event_date,
                         metadata=content.metadata,
                         tags=content.tags,
+                        observation_scopes=content.observation_scopes,
                     )
 
                     extracted_facts.append(extracted_fact)
@@ -1836,6 +2488,9 @@ async def extract_facts_from_contents(
 
     # Step 4: Add time offsets to preserve ordering within each content
     _add_temporal_offsets(extracted_facts, contents)
+
+    # Step 5: Auto-tag facts from label groups with tag=True
+    _inject_label_tags(extracted_facts, config)
 
     return extracted_facts, chunks_metadata, total_usage
 
@@ -1892,3 +2547,24 @@ def _add_temporal_offsets(facts: list[ExtractedFactType], contents: list[RetainC
             fact.occurred_end = parse_datetime_flexible(fact.occurred_end) + offset
         if fact.mentioned_at:
             fact.mentioned_at = parse_datetime_flexible(fact.mentioned_at) + offset
+
+
+def _inject_label_tags(facts: list[ExtractedFactType], config) -> None:
+    """
+    For label groups with tag=True, add extracted key:value label entities
+    to each fact's tags list. Modifies facts in place.
+
+    This lets entity labels double as tags, enabling filtering via the
+    existing tags API without any extra query infrastructure.
+    """
+    labels_cfg = parse_entity_labels(getattr(config, "entity_labels", None))
+    if not labels_cfg:
+        return
+    tag_group_keys = {g.key.lower() for g in labels_cfg.attributes if g.tag}
+    if not tag_group_keys:
+        return
+    for fact in facts:
+        label_tags = [e for e in fact.entities if ":" in e and e.split(":", 1)[0].lower() in tag_group_keys]
+        if label_tags:
+            existing = set(fact.tags)
+            fact.tags = fact.tags + [t for t in label_tags if t not in existing]

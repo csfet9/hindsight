@@ -233,6 +233,35 @@ class TestFilterResultsByTags:
         assert len(filtered) == 1
         assert filtered[0].tags == ["a", "b", "c"]  # Has a, b, AND c
 
+    def test_all_strict_superset_observation_matches_incoming_memory_tags(self):
+        """
+        Consolidation scenario: an incoming memory with tags ['user:bob', 'session:id1']
+        uses all_strict matching to find existing observations.
+
+        An observation tagged ['user:bob', 'session:id1', 'place:online'] IS matched
+        because it contains all of the incoming memory's tags (superset).
+        This is NOT exact matching — an observation with extra tags is still a valid match.
+        """
+        # Incoming memory tags (e.g. from a new retain call)
+        incoming_tags = ["user:bob", "session:id1"]
+
+        # Candidate observations with different tag sets
+        exact_match = MockResult(["user:bob", "session:id1"])
+        superset_match = MockResult(["session:id1", "user:bob", "place:online"])
+        different_user = MockResult(["user:alice", "session:id1"])
+        missing_session = MockResult(["user:bob"])
+
+        results = [exact_match, superset_match, different_user, missing_session]
+        filtered = filter_results_by_tags(results, incoming_tags, match="all_strict")
+
+        # Both exact_match and superset_match have all incoming tags → both match
+        assert len(filtered) == 2
+        assert exact_match in filtered
+        assert superset_match in filtered
+        # different_user and missing_session are excluded because they lack at least one tag
+        assert different_user not in filtered
+        assert missing_session not in filtered
+
 
 # ============================================================================
 # Integration Tests for tags in retain/recall/reflect
@@ -890,3 +919,40 @@ async def test_list_tags_ordered_by_count(api_client):
     # common (3) should come before medium (2) which should come before rare (1)
     assert tags.index("common") < tags.index("medium")
     assert tags.index("medium") < tags.index("rare")
+
+
+@pytest.mark.asyncio
+async def test_list_memories_includes_tags(api_client, test_bank_id):
+    """Test that list memories endpoint returns tags for each memory unit.
+
+    Regression test: tags were previously omitted from the SELECT query in
+    list_memory_units, causing the memory dialog in the UI to show no tags
+    even when memories had been stored with tags.
+    """
+    tags = ["user_alice", "session_xyz", "project_alpha", "team_eng", "env_prod", "region_us"]
+
+    response = await api_client.post(
+        f"/v1/default/banks/{test_bank_id}/memories",
+        json={
+            "items": [
+                {
+                    "content": "Alice is a senior engineer on the platform team.",
+                    "tags": tags,
+                }
+            ]
+        },
+    )
+    assert response.status_code == 200
+
+    # List memories and verify all tags are returned
+    response = await api_client.get(f"/v1/default/banks/{test_bank_id}/memories/list")
+    assert response.status_code == 200
+    result = response.json()
+
+    assert result["total"] > 0
+    memory_item = next((item for item in result["items"] if "Alice" in item["text"]), None)
+    assert memory_item is not None, "Should find the stored memory"
+    assert "tags" in memory_item, "Memory item must include a 'tags' field"
+    assert set(memory_item["tags"]) == set(tags), (
+        f"All {len(tags)} tags should be returned, got: {memory_item['tags']}"
+    )

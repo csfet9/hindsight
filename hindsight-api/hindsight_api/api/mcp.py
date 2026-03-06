@@ -8,11 +8,47 @@ from contextvars import ContextVar
 from fastmcp import FastMCP
 
 from hindsight_api import MemoryEngine
+from hindsight_api.config import _get_raw_config
 from hindsight_api.engine.memory_engine import _current_schema
 from hindsight_api.extensions import MCPExtension, load_extension
 from hindsight_api.extensions.tenant import AuthenticationError
 from hindsight_api.mcp_tools import MCPToolsConfig, register_mcp_tools
 from hindsight_api.models import RequestContext
+
+# All tools available in the system (explicit list — no wildcards)
+_ALL_TOOLS: frozenset[str] = frozenset(
+    {
+        "retain",
+        "recall",
+        "reflect",
+        "list_banks",
+        "create_bank",
+        "list_mental_models",
+        "get_mental_model",
+        "create_mental_model",
+        "update_mental_model",
+        "delete_mental_model",
+        "refresh_mental_model",
+        "list_directives",
+        "create_directive",
+        "delete_directive",
+        "list_memories",
+        "get_memory",
+        "delete_memory",
+        "list_documents",
+        "get_document",
+        "delete_document",
+        "list_operations",
+        "get_operation",
+        "cancel_operation",
+        "list_tags",
+        "get_bank",
+        "get_bank_stats",
+        "update_bank",
+        "delete_bank",
+        "clear_memories",
+    }
+)
 
 # Configure logging from HINDSIGHT_API_LOG_LEVEL environment variable
 _log_level_str = os.environ.get("HINDSIGHT_API_LOG_LEVEL", "info").lower()
@@ -78,21 +114,15 @@ def create_mcp_server(memory: MemoryEngine, multi_bank: bool = True) -> FastMCP:
                    If False, only expose bank-scoped tools without bank_id parameters.
 
     Returns:
-        Configured FastMCP server instance with stateless_http enabled
+        Configured FastMCP server instance
     """
-    # Use stateless_http=True for Claude Code compatibility
-    mcp = FastMCP("hindsight-mcp-server", stateless_http=True)
+    mcp = FastMCP("hindsight-mcp-server")
 
-    # Configure and register tools using shared module
-    config = MCPToolsConfig(
-        bank_id_resolver=get_current_bank_id,
-        api_key_resolver=get_current_api_key,  # Propagate API key for tenant auth
-        tenant_id_resolver=get_current_tenant_id,  # Propagate tenant_id for usage metering
-        api_key_id_resolver=get_current_api_key_id,  # Propagate api_key_id for usage metering
-        include_bank_id_param=multi_bank,
-        tools=None
-        if multi_bank
-        else {
+    global_config = _get_raw_config()
+
+    # Tools available for this mode (multi-bank exposes all tools; single-bank excludes bank-management tools)
+    _SINGLE_BANK_TOOLS: frozenset[str] = frozenset(
+        {
             "retain",
             "recall",
             "reflect",
@@ -102,8 +132,40 @@ def create_mcp_server(memory: MemoryEngine, multi_bank: bool = True) -> FastMCP:
             "update_mental_model",
             "delete_mental_model",
             "refresh_mental_model",
-        },  # Scoped tools for single-bank mode (excludes bank management: list_banks, create_bank)
-        retain_fire_and_forget=False,  # HTTP MCP supports sync/async modes
+            "list_directives",
+            "create_directive",
+            "delete_directive",
+            "list_memories",
+            "get_memory",
+            "delete_memory",
+            "list_documents",
+            "get_document",
+            "delete_document",
+            "list_operations",
+            "get_operation",
+            "cancel_operation",
+            "list_tags",
+            "get_bank",
+            "update_bank",
+            "delete_bank",
+            "clear_memories",
+        }
+    )
+    base_tools: frozenset[str] | None = None if multi_bank else _SINGLE_BANK_TOOLS
+
+    # Apply global mcp_enabled_tools filter (env-level allowlist)
+    if global_config.mcp_enabled_tools is not None:
+        allowed = frozenset(global_config.mcp_enabled_tools)
+        base_tools = (base_tools if base_tools is not None else _ALL_TOOLS) & allowed
+
+    # Configure and register tools using shared module
+    config = MCPToolsConfig(
+        bank_id_resolver=get_current_bank_id,
+        api_key_resolver=get_current_api_key,  # Propagate API key for tenant auth
+        tenant_id_resolver=get_current_tenant_id,  # Propagate tenant_id for usage metering
+        api_key_id_resolver=get_current_api_key_id,  # Propagate api_key_id for usage metering
+        include_bank_id_param=multi_bank,
+        tools=base_tools,
     )
 
     register_mcp_tools(mcp, memory, config)
@@ -211,9 +273,9 @@ class MCPMiddleware:
         else:
             # Create servers internally (for direct construction / tests)
             self.multi_bank_server = create_mcp_server(memory, multi_bank=True)
-            self.multi_bank_app = self.multi_bank_server.http_app(path="/")
+            self.multi_bank_app = self.multi_bank_server.http_app(path="/", stateless_http=True)
             self.single_bank_server = create_mcp_server(memory, multi_bank=False)
-            self.single_bank_app = self.single_bank_server.http_app(path="/")
+            self.single_bank_app = self.single_bank_server.http_app(path="/", stateless_http=True)
 
     def _get_header(self, scope: dict, name: str) -> str | None:
         """Extract a header value from ASGI scope."""
@@ -269,7 +331,7 @@ class MCPMiddleware:
                 auth_tenant_id = auth_context.tenant_id
                 auth_api_key_id = auth_context.api_key_id
             except AuthenticationError as e:
-                await self._send_error(send, 401, str(e))
+                await self._send_error(send, 401, str(e), extra_headers=e.headers)
                 return
 
         # Set schema from tenant context so downstream DB queries use the correct schema
@@ -351,14 +413,17 @@ class MCPMiddleware:
             if schema_token is not None:
                 _current_schema.reset(schema_token)
 
-    async def _send_error(self, send, status: int, message: str):
+    async def _send_error(self, send, status: int, message: str, extra_headers: dict[str, str] | None = None):
         """Send an error response."""
         body = json.dumps({"error": message}).encode()
+        headers = [(b"content-type", b"application/json")]
+        for key, value in (extra_headers or {}).items():
+            headers.append((key.encode(), value.encode()))
         await send(
             {
                 "type": "http.response.start",
                 "status": status,
-                "headers": [(b"content-type", b"application/json")],
+                "headers": headers,
             }
         )
         await send(
@@ -379,9 +444,9 @@ def create_mcp_servers(memory: MemoryEngine):
         Tuple of (multi_bank_server, single_bank_server, multi_bank_app, single_bank_app)
     """
     multi_bank_server = create_mcp_server(memory, multi_bank=True)
-    multi_bank_app = multi_bank_server.http_app(path="/")
+    multi_bank_app = multi_bank_server.http_app(path="/", stateless_http=True)
 
     single_bank_server = create_mcp_server(memory, multi_bank=False)
-    single_bank_app = single_bank_server.http_app(path="/")
+    single_bank_app = single_bank_server.http_app(path="/", stateless_http=True)
 
     return multi_bank_server, single_bank_server, multi_bank_app, single_bank_app

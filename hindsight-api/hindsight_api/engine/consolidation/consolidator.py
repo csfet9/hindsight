@@ -9,30 +9,102 @@ Observations are stored in memory_units with fact_type='observation' and include
 - proof_count: Number of supporting memories
 - source_memory_ids: Array of memory UUIDs that contribute to this observation
 - history: JSONB tracking changes over time
+
+NOTE: Observations are distinct from mental models (pinned reflections).
+- Observations: auto-generated bottom-up by this engine from raw facts (memory_units table, fact_type='observation')
+- Mental models: user-defined queries stored in the mental_models table, refreshed on demand via reflect
 """
 
 import json
 import logging
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from itertools import combinations
 from typing import TYPE_CHECKING, Any
+
+from pydantic import BaseModel
 
 from ...config import get_config
 from ..memory_engine import fq_table
 from ..retain import embedding_utils
-from .prompts import (
-    CONSOLIDATION_SYSTEM_PROMPT,
-    CONSOLIDATION_USER_PROMPT,
-)
+from .prompts import build_batch_consolidation_prompt
 
 if TYPE_CHECKING:
     from asyncpg import Connection
 
     from ...api.http import RequestContext
     from ..memory_engine import MemoryEngine
+    from ..response_models import MemoryFact, RecallResult
 
 logger = logging.getLogger(__name__)
+
+
+class _CreateAction(BaseModel):
+    text: str
+    source_fact_ids: list[str]  # memory UUIDs from the NEW FACTS list
+
+
+class _UpdateAction(BaseModel):
+    text: str
+    observation_id: str  # UUID of the existing observation to update
+    source_fact_ids: list[str]  # memory UUIDs from the NEW FACTS list
+
+
+class _DeleteAction(BaseModel):
+    observation_id: str  # UUID of the observation to remove
+
+
+class _ConsolidationBatchResponse(BaseModel):
+    creates: list[_CreateAction] = []
+    updates: list[_UpdateAction] = []
+    deletes: list[_DeleteAction] = []
+
+
+@dataclass
+class _BatchLLMResult:
+    creates: list[_CreateAction] = field(default_factory=list)
+    updates: list[_UpdateAction] = field(default_factory=list)
+    deletes: list[_DeleteAction] = field(default_factory=list)
+    obs_count: int = 0
+    prompt_chars: int = 0
+
+
+@dataclass
+class _SourceAggregation:
+    """Fields inherited by an observation from its source memories."""
+
+    event_date: datetime | None
+    occurred_start: datetime | None
+    occurred_end: datetime | None
+    mentioned_at: datetime | None
+    tags: list[str]
+
+
+def _aggregate_source_fields(source_mems: list[dict[str, Any]], tags: list[str] | None = None) -> _SourceAggregation:
+    """Compute the observation fields inherited from a set of source memories.
+
+    Temporal aggregation rules:
+    - ``event_date``    — earliest across sources (min)
+    - ``occurred_start`` — earliest across sources (min)
+    - ``occurred_end``   — latest across sources (max)
+    - ``mentioned_at``   — latest across sources (max)
+
+    Fields remain ``None`` when no source memory carries that information, so
+    observations are never stamped with an artificial timestamp.
+
+    ``tags`` defaults to those of the first source memory when not explicitly
+    provided (all memories in a consolidation batch share the same tag set).
+    """
+    effective_tags = tags if tags is not None else (source_mems[0].get("tags") or [] if source_mems else [])
+    return _SourceAggregation(
+        event_date=_min_date(m.get("event_date") for m in source_mems),
+        occurred_start=_min_date(m.get("occurred_start") for m in source_mems),
+        occurred_end=_max_date(m.get("occurred_end") for m in source_mems),
+        mentioned_at=_max_date(m.get("mentioned_at") for m in source_mems),
+        tags=effective_tags,
+    )
 
 
 class ConsolidationPerfLog:
@@ -43,6 +115,9 @@ class ConsolidationPerfLog:
         self.start_time = time.time()
         self.lines: list[str] = []
         self.timings: dict[str, float] = {}
+        self.llm_calls: int = 0
+        self.total_obs_in_context: int = 0
+        self.total_prompt_chars: int = 0
 
     def log(self, message: str) -> None:
         """Add a log line."""
@@ -54,6 +129,12 @@ class ConsolidationPerfLog:
             self.timings[key] += duration
         else:
             self.timings[key] = duration
+
+    def record_llm_call(self, obs_count: int, prompt_chars: int) -> None:
+        """Record stats for a single LLM call."""
+        self.llm_calls += 1
+        self.total_obs_in_context += obs_count
+        self.total_prompt_chars += prompt_chars
 
     def flush(self) -> None:
         """Flush all log lines to the logger."""
@@ -85,8 +166,14 @@ async def run_consolidation_job(
     """
     # Resolve bank-specific config with hierarchical overrides
     config = await memory_engine._config_resolver.resolve_full_config(bank_id, request_context)
+
+    # Build a configured LLM wrapper that applies per-bank settings (e.g. safety settings)
+    # to every call without leaking across operations.
+    llm_config = memory_engine._consolidation_llm_config.with_config(config)
+
     perf = ConsolidationPerfLog(bank_id)
     max_memories_per_batch = config.consolidation_batch_size
+    llm_batch_size = max(1, config.consolidation_llm_batch_size)
 
     # Check if consolidation is enabled
     if not config.enable_observations:
@@ -100,7 +187,7 @@ async def run_consolidation_job(
         t0 = time.time()
         bank_row = await conn.fetchrow(
             f"""
-            SELECT bank_id, name, mission
+            SELECT bank_id, name
             FROM {fq_table("banks")}
             WHERE bank_id = $1
             """,
@@ -111,7 +198,6 @@ async def run_consolidation_job(
             logger.warning(f"Bank {bank_id} not found for consolidation")
             return {"status": "bank_not_found", "bank_id": bank_id}
 
-        mission = bank_row["mission"] or "General memory consolidation"
         perf.record_timing("fetch_bank", time.time() - t0)
 
         # Count total unconsolidated memories for progress logging
@@ -134,11 +220,12 @@ async def run_consolidation_job(
     perf.log(f"[1] Found {total_count} pending memories to consolidate")
 
     # Process each memory with individual commits for crash recovery
-    stats = {
+    stats: dict[str, int] = {
         "memories_processed": 0,
         "observations_created": 0,
         "observations_updated": 0,
         "observations_merged": 0,
+        "observations_deleted": 0,
         "actions_executed": 0,
         "skipped": 0,
     }
@@ -146,21 +233,15 @@ async def run_consolidation_job(
     # Track all unique tags from consolidated memories for mental model refresh filtering
     consolidated_tags: set[str] = set()
 
-    batch_num = 0
-    last_progress_timings = {}  # Track timings at last progress log
+    llm_batch_num = 0
     while True:
-        batch_num += 1
-        batch_start = time.time()
-
-        # Snapshot timings at batch start for per-batch calculation
-        batch_start_timings = perf.timings.copy()
-
         # Fetch next batch of unconsolidated memories
         async with pool.acquire() as conn:
             t0 = time.time()
             memories = await conn.fetch(
                 f"""
-                SELECT id, text, fact_type, occurred_start, occurred_end, event_date, tags, mentioned_at
+                SELECT id, text, fact_type, occurred_start, occurred_end, event_date, tags, mentioned_at,
+                       observation_scopes
                 FROM {fq_table("memory_units")}
                 WHERE bank_id = $1
                   AND consolidated_at IS NULL
@@ -176,95 +257,164 @@ async def run_consolidation_job(
         if not memories:
             break  # No more unconsolidated memories
 
-        for memory in memories:
-            mem_start = time.time()
+        # Group memories by exact tag set before batching — security requirement:
+        # memories with different tags must never share an LLM call.
+        tag_groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+        for m in memories:
+            tag_key = tuple(sorted(m.get("tags") or []))
+            tag_groups.setdefault(tag_key, []).append(dict(m))
 
-            # Track tags from this memory for mental model refresh filtering
-            memory_tags = memory.get("tags") or []
-            if memory_tags:
-                consolidated_tags.update(memory_tags)
+        # Flatten into LLM batches respecting both tag groups and llm_batch_size
+        llm_batches: list[list[dict[str, Any]]] = []
+        for group in tag_groups.values():
+            for i in range(0, len(group), llm_batch_size):
+                llm_batches.append(group[i : i + llm_batch_size])
 
-            # Process the memory (uses its own connection internally)
+        for llm_batch in llm_batches:
+            llm_batch_num += 1
+            llm_batch_start = time.time()
+
+            # Snapshot perf and stats before this LLM batch
+            snap_timings = perf.timings.copy()
+            snap_llm_calls = perf.llm_calls
+            snap_total_chars = perf.total_prompt_chars
+            snap_stats = stats.copy()
+
+            # Track tags for mental model refresh filtering
+            for memory in llm_batch:
+                memory_tags = memory.get("tags") or []
+                if memory_tags:
+                    consolidated_tags.update(memory_tags)
+
             async with pool.acquire() as conn:
-                result = await _process_memory(
-                    conn=conn,
-                    memory_engine=memory_engine,
-                    bank_id=bank_id,
-                    memory=dict(memory),
-                    mission=mission,
-                    request_context=request_context,
-                    perf=perf,
+                # Determine observation_scopes for this batch. All memories in a batch share
+                # the same tags (enforced by tag_groups), so we only check the first memory.
+                # asyncpg returns JSONB columns as raw JSON strings, so parse if needed.
+                _obs_raw = llm_batch[0].get("observation_scopes") if llm_batch else None
+                _obs_parsed = json.loads(_obs_raw) if isinstance(_obs_raw, str) else _obs_raw
+
+                # Resolve the scope spec into a concrete list[list[str]] (or None for combined).
+                if _obs_parsed == "per_tag":
+                    _memory_tags = llm_batch[0].get("tags") or []
+                    obs_tags_list = [[tag] for tag in _memory_tags] if _memory_tags else None
+                elif _obs_parsed == "all_combinations":
+                    _memory_tags = llm_batch[0].get("tags") or []
+                    obs_tags_list = (
+                        [
+                            list(combo)
+                            for r in range(1, len(_memory_tags) + 1)
+                            for combo in combinations(_memory_tags, r)
+                        ]
+                        if _memory_tags
+                        else None
+                    )
+                elif _obs_parsed == "combined" or _obs_parsed is None:
+                    obs_tags_list = None  # single combined pass (default behaviour)
+                else:
+                    # explicit list[list[str]]
+                    obs_tags_list = _obs_parsed
+
+                batch_deleted: int = 0
+                if obs_tags_list:
+                    # Multi-pass: run one observation consolidation pass per tag set
+                    results = []
+                    for obs_tags in obs_tags_list:
+                        pass_results, pass_deleted = await _process_memory_batch(
+                            conn=conn,
+                            memory_engine=memory_engine,
+                            llm_config=llm_config,
+                            bank_id=bank_id,
+                            memories=llm_batch,
+                            request_context=request_context,
+                            perf=perf,
+                            config=config,
+                            obs_tags_override=obs_tags,
+                        )
+                        batch_deleted += pass_deleted
+                        # Merge results: prefer non-skipped actions
+                        if not results:
+                            results = pass_results
+                        else:
+                            for i, (existing, new) in enumerate(zip(results, pass_results)):
+                                if existing.get("action") == "skipped" and new.get("action") != "skipped":
+                                    results[i] = new
+                                elif existing.get("action") != "skipped" and new.get("action") != "skipped":
+                                    # Both did something — combine into "multiple"
+                                    existing_created = existing.get(
+                                        "created", 1 if existing.get("action") == "created" else 0
+                                    )
+                                    existing_updated = existing.get(
+                                        "updated", 1 if existing.get("action") == "updated" else 0
+                                    )
+                                    new_created = new.get("created", 1 if new.get("action") == "created" else 0)
+                                    new_updated = new.get("updated", 1 if new.get("action") == "updated" else 0)
+                                    total = existing_created + existing_updated + new_created + new_updated
+                                    results[i] = {
+                                        "action": "multiple",
+                                        "created": existing_created + new_created,
+                                        "updated": existing_updated + new_updated,
+                                        "merged": 0,
+                                        "total_actions": total,
+                                    }
+                else:
+                    # Normal single pass using the memory's own tags
+                    results, batch_deleted = await _process_memory_batch(
+                        conn=conn,
+                        memory_engine=memory_engine,
+                        llm_config=llm_config,
+                        bank_id=bank_id,
+                        memories=llm_batch,
+                        request_context=request_context,
+                        perf=perf,
+                        config=config,
+                    )
+                stats["observations_deleted"] += batch_deleted
+
+                await conn.executemany(
+                    f"UPDATE {fq_table('memory_units')} SET consolidated_at = NOW() WHERE id = $1",
+                    [(m["id"],) for m in llm_batch],
                 )
 
-                # Mark memory as consolidated (committed immediately)
-                await conn.execute(
-                    f"""
-                    UPDATE {fq_table("memory_units")}
-                    SET consolidated_at = NOW()
-                    WHERE id = $1
-                    """,
-                    memory["id"],
-                )
+            for result in results:
+                stats["memories_processed"] += 1
+                action = result.get("action")
+                if action == "created":
+                    stats["observations_created"] += 1
+                    stats["actions_executed"] += 1
+                elif action == "updated":
+                    stats["observations_updated"] += 1
+                    stats["actions_executed"] += 1
+                elif action == "merged":
+                    stats["observations_merged"] += 1
+                    stats["actions_executed"] += 1
+                elif action == "multiple":
+                    stats["observations_created"] += result.get("created", 0)
+                    stats["observations_updated"] += result.get("updated", 0)
+                    stats["observations_merged"] += result.get("merged", 0)
+                    stats["actions_executed"] += result.get("total_actions", 0)
+                elif action == "skipped":
+                    stats["skipped"] += 1
 
-            mem_time = time.time() - mem_start
-            perf.record_timing("process_memory_total", mem_time)
-
-            stats["memories_processed"] += 1
-
-            action = result.get("action")
-            if action == "created":
-                stats["observations_created"] += 1
-                stats["actions_executed"] += 1
-            elif action == "updated":
-                stats["observations_updated"] += 1
-                stats["actions_executed"] += 1
-            elif action == "merged":
-                stats["observations_merged"] += 1
-                stats["actions_executed"] += 1
-            elif action == "multiple":
-                stats["observations_created"] += result.get("created", 0)
-                stats["observations_updated"] += result.get("updated", 0)
-                stats["observations_merged"] += result.get("merged", 0)
-                stats["actions_executed"] += result.get("total_actions", 0)
-            elif action == "skipped":
-                stats["skipped"] += 1
-
-            # Log progress periodically with timing breakdown
-            if stats["memories_processed"] % 10 == 0:
-                # Calculate timing deltas since last progress log
-                timing_parts = []
-                for key in ["recall", "llm", "embedding", "db_write"]:
-                    if key in perf.timings:
-                        delta = perf.timings[key] - last_progress_timings.get(key, 0)
-                        timing_parts.append(f"{key}={delta:.2f}s")
-
-                timing_str = f" | {', '.join(timing_parts)}" if timing_parts else ""
-                logger.info(
-                    f"[CONSOLIDATION] bank={bank_id} progress: "
-                    f"{stats['memories_processed']}/{total_count} memories processed{timing_str}"
-                )
-
-                # Update last progress snapshot
-                last_progress_timings = perf.timings.copy()
-
-        batch_time = time.time() - batch_start
-        perf.log(
-            f"[2] Batch {batch_num}: {len(memories)} memories in {batch_time:.3f}s "
-            f"(avg {batch_time / len(memories):.3f}s/memory)"
-        )
-
-        # Log timing breakdown after each batch (delta from batch start)
-        timing_parts = []
-        for key in ["recall", "llm", "embedding", "db_write"]:
-            if key in perf.timings:
-                delta = perf.timings[key] - batch_start_timings.get(key, 0)
-                timing_parts.append(f"{key}={delta:.3f}s")
-
-        if timing_parts:
-            avg_per_memory = batch_time / len(memories) if memories else 0
+            # Per-LLM-batch log
+            llm_batch_time = time.time() - llm_batch_start
+            timing_parts = []
+            for key in ["recall", "llm", "embedding", "db_write"]:
+                if key in perf.timings:
+                    delta = perf.timings[key] - snap_timings.get(key, 0)
+                    timing_parts.append(f"{key}={delta:.3f}s")
+            input_tokens = int((perf.total_prompt_chars - snap_total_chars) / 4)
+            batch_created = stats["observations_created"] - snap_stats["observations_created"]
+            batch_updated = stats["observations_updated"] - snap_stats["observations_updated"]
+            batch_skipped = stats["skipped"] - snap_stats["skipped"]
+            llm_calls_made = perf.llm_calls - snap_llm_calls
             logger.info(
-                f"[CONSOLIDATION] bank={bank_id} batch {batch_num}/{len(memories)} memories: "
-                f"{', '.join(timing_parts)} | avg={avg_per_memory:.3f}s/memory"
+                f"[CONSOLIDATION] bank={bank_id} llm_batch #{llm_batch_num}"
+                f" ({len(llm_batch)} memories, {llm_calls_made} llm calls)"
+                f" | {stats['memories_processed']}/{total_count} processed"
+                f" | {', '.join(timing_parts)}"
+                f" | created={batch_created} updated={batch_updated} skipped={batch_skipped}"
+                f" | input_tokens=~{input_tokens}"
+                f" | avg={llm_batch_time / len(llm_batch):.3f}s/memory"
             )
 
     # Build summary
@@ -287,6 +437,10 @@ async def run_consolidation_job(
         timing_parts.append(f"embedding={perf.timings['embedding']:.3f}s")
     if "db_write" in perf.timings:
         timing_parts.append(f"db_write={perf.timings['db_write']:.3f}s")
+
+    if perf.llm_calls > 0:
+        timing_parts.append(f"avg_obs={perf.total_obs_in_context / perf.llm_calls:.1f}")
+        timing_parts.append(f"avg_prompt_tokens=~{perf.total_prompt_chars / perf.llm_calls / 4:.0f}")
 
     if timing_parts:
         perf.log(f"[4] Timing breakdown: {', '.join(timing_parts)}")
@@ -401,220 +555,254 @@ async def _trigger_mental_model_refreshes(
     return refreshed_count
 
 
-async def _process_memory(
+async def _process_memory_batch(
     conn: "Connection",
     memory_engine: "MemoryEngine",
+    llm_config: Any,
     bank_id: str,
-    memory: dict[str, Any],
-    mission: str,
+    memories: list[dict[str, Any]],
     request_context: "RequestContext",
     perf: ConsolidationPerfLog | None = None,
-) -> dict[str, Any]:
+    config: Any = None,
+    obs_tags_override: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
     """
-    Process a single memory for consolidation using a SINGLE LLM call.
+    Process a batch of memories in a single LLM call.
 
-    This function:
-    1. Finds related observations (can be empty)
-    2. Uses ONE LLM call to extract durable knowledge AND decide on actions
-    3. Executes array of actions (can be multiple creates/updates)
+    Steps:
+    1. Parallel recalls — one per fact (read-only; safe to parallelise)
+    2. Union of retrieved observations across the batch (deduped by id)
+    3. Single LLM call with all N facts + unioned observations
+    4. Sequential action execution (writes remain serial for consistency)
+    5. Returns one result dict per memory, in the same order as `memories`
 
-    The LLM handles all cases:
-    - No related observations: returns create action(s) with extracted durable knowledge
-    - Related observations exist: returns update/create actions based on tag routing
-    - Purely ephemeral fact: returns empty array (skip)
+    Per-fact security: action execution validates each learning_id against the
+    observations that were recalled specifically for that fact, so cross-tag
+    updates cannot occur.
 
-    Returns:
-        Dict with action summary: created/updated/merged counts
+    Args:
+        obs_tags_override: When set, use these tags for observation recall and
+            create/update instead of the memory's own tags. This enables multi-pass
+            consolidation where a single memory can contribute to observations
+            scoped at different tag levels (e.g., user-level vs session-level).
     """
-    from ...tracing import get_tracer, is_tracing_enabled
+    import asyncio
 
-    fact_text = memory["text"]
-    memory_id = memory["id"]
-    fact_tags = memory.get("tags") or []
+    # 1. Parallel recalls — one per fact
+    # When obs_tags_override is set, use it as the observation scope for all facts.
+    t0 = time.time()
+    observation_scope_tags = obs_tags_override if obs_tags_override is not None else None
+    recall_tasks = [
+        _find_related_observations(
+            memory_engine=memory_engine,
+            bank_id=bank_id,
+            query=m["text"],
+            request_context=request_context,
+            tags=observation_scope_tags if observation_scope_tags is not None else (m.get("tags") or []),
+        )
+        for m in memories
+    ]
+    per_fact_recalls = await asyncio.gather(*recall_tasks)
+    if perf:
+        perf.record_timing("recall", time.time() - t0)
 
-    # Create parent span for this memory's consolidation
-    tracer = get_tracer()
-    if is_tracing_enabled():
-        consolidation_span = tracer.start_span("hindsight.consolidation")
-        consolidation_span.set_attribute("hindsight.memory_id", str(memory_id))
-        consolidation_span.set_attribute("hindsight.bank_id", bank_id)
+    # 2. Build per-fact observation sets (keyed by memory ID string) for secure action validation
+    per_fact_obs_ids: dict[str, set[str]] = {
+        str(memories[i]["id"]): {str(obs.id) for obs in r.results} for i, r in enumerate(per_fact_recalls)
+    }
+
+    # Union all observations (deduped by id)
+    seen_ids: set[str] = set()
+    union_observations: list["MemoryFact"] = []
+    union_source_facts: dict[str, "MemoryFact"] = {}
+    for recall_result in per_fact_recalls:
+        for obs in recall_result.results:
+            obs_id = str(obs.id)
+            if obs_id not in seen_ids:
+                seen_ids.add(obs_id)
+                union_observations.append(obs)
+        if recall_result.source_facts:
+            union_source_facts.update(recall_result.source_facts)
+
+    # 3. Single LLM call
+    t0 = time.time()
+    llm_result = await _consolidate_batch_with_llm(
+        llm_config=llm_config,
+        memories=memories,
+        union_observations=union_observations,
+        union_source_facts=union_source_facts,
+        config=config,
+    )
+    if perf:
+        perf.record_timing("llm", time.time() - t0)
+        perf.record_llm_call(llm_result.obs_count, llm_result.prompt_chars)
+
+    # 4. Sequential execution of creates / updates / deletes
+    # Track which memory indices participated so we can build per-memory results for stats
+    per_memory_created: set[str] = set()
+    per_memory_updated: set[str] = set()
+
+    # Determine effective tag scope for observations.
+    # When obs_tags_override is set, use it; otherwise use the memory's own tags.
+    if obs_tags_override is not None:
+        fact_tags = obs_tags_override
     else:
-        consolidation_span = None
+        # All memories in the batch share the same tag set (enforced by batching)
+        fact_tags = memories[0].get("tags") or [] if memories else []
 
-    try:
-        # Find related observations using the full recall system
-        # SECURITY: Pass tags to ensure observations don't leak across security boundaries
-        t0 = time.time()
-        related_observations = await _find_related_observations(
+    mem_by_id = {str(m["id"]): m for m in memories}
+
+    for create in llm_result.creates:
+        source_mems = [mem_by_id[fid] for fid in create.source_fact_ids if fid in mem_by_id]
+        if not source_mems:
+            continue
+        agg = _aggregate_source_fields(source_mems, tags=fact_tags)
+        await _execute_create_action(
             conn=conn,
             memory_engine=memory_engine,
             bank_id=bank_id,
-            query=fact_text,
-            request_context=request_context,
-            tags=fact_tags,  # Pass source memory's tags for security
+            source_memory_ids=[m["id"] for m in source_mems],
+            text=create.text,
+            source_fact_tags=agg.tags,
+            event_date=agg.event_date,
+            occurred_start=agg.occurred_start,
+            occurred_end=agg.occurred_end,
+            mentioned_at=agg.mentioned_at,
+            perf=perf,
         )
-        if perf:
-            perf.record_timing("recall", time.time() - t0)
+        for m in source_mems:
+            per_memory_created.add(str(m["id"]))
 
-        # Single LLM call handles ALL cases (with or without existing observations)
-        # Note: Tags are NOT passed to LLM - they are handled algorithmically
-        t0 = time.time()
-        actions = await _consolidate_with_llm(
+    for update in llm_result.updates:
+        source_mems = [mem_by_id[fid] for fid in update.source_fact_ids if fid in mem_by_id]
+        if not source_mems:
+            continue
+        # Security: the observation must have been recalled for at least one of the source facts
+        if not any(update.observation_id in per_fact_obs_ids.get(str(m["id"]), set()) for m in source_mems):
+            logger.debug(
+                f"Batch consolidation: rejected update — observation {update.observation_id} "
+                f"not in any source fact's recall"
+            )
+            continue
+        agg = _aggregate_source_fields(source_mems, tags=fact_tags)
+        await _execute_update_action(
+            conn=conn,
             memory_engine=memory_engine,
-            fact_text=fact_text,
-            observations=related_observations,  # Can be empty list
-            mission=mission,
+            bank_id=bank_id,
+            source_memory_ids=[m["id"] for m in source_mems],
+            observation_id=update.observation_id,
+            new_text=update.text,
+            observations=union_observations,
+            source_fact_tags=agg.tags,
+            source_occurred_start=agg.occurred_start,
+            source_occurred_end=agg.occurred_end,
+            source_mentioned_at=agg.mentioned_at,
+            perf=perf,
         )
-        if perf:
-            perf.record_timing("llm", time.time() - t0)
+        for m in source_mems:
+            per_memory_updated.add(str(m["id"]))
 
-        if not actions:
-            # LLM returned empty array - fact is purely ephemeral, skip
-            return {"action": "skipped", "reason": "no_durable_knowledge"}
+    deleted_count = 0
+    for delete in llm_result.deletes:
+        # Security: the observation must be present in the unioned recall
+        if not any(str(obs.id) == delete.observation_id for obs in union_observations):
+            logger.debug(
+                f"Batch consolidation: rejected delete — observation {delete.observation_id} not in unioned recall"
+            )
+            continue
+        await _execute_delete_action(conn=conn, bank_id=bank_id, observation_id=delete.observation_id)
+        deleted_count += 1
 
-        # Execute all actions and collect results
-        results = []
-        for action in actions:
-            action_type = action.get("action")
-            if action_type == "update":
-                result = await _execute_update_action(
-                    conn=conn,
-                    memory_engine=memory_engine,
-                    bank_id=bank_id,
-                    memory_id=memory_id,
-                    action=action,
-                    observations=related_observations,
-                    source_fact_tags=fact_tags,  # Pass source fact's tags for security
-                    source_occurred_start=memory.get("occurred_start"),
-                    source_occurred_end=memory.get("occurred_end"),
-                    source_mentioned_at=memory.get("mentioned_at"),
-                    perf=perf,
-                )
-                results.append(result)
-            elif action_type == "create":
-                result = await _execute_create_action(
-                    conn=conn,
-                    memory_engine=memory_engine,
-                    bank_id=bank_id,
-                    memory_id=memory_id,
-                    action=action,
-                    source_fact_tags=fact_tags,  # Pass source fact's tags for security
-                    event_date=memory.get("event_date"),
-                    occurred_start=memory.get("occurred_start"),
-                    occurred_end=memory.get("occurred_end"),
-                    mentioned_at=memory.get("mentioned_at"),
-                    perf=perf,
-                )
-                results.append(result)
+    # Build per-memory result dicts for the stats tracker in the outer loop
+    results: list[dict[str, Any]] = []
+    for m in memories:
+        mid = str(m["id"])
+        created = mid in per_memory_created
+        updated = mid in per_memory_updated
+        if created and updated:
+            results.append({"action": "multiple", "created": 1, "updated": 1, "merged": 0, "total_actions": 2})
+        elif created:
+            results.append({"action": "created"})
+        elif updated:
+            results.append({"action": "updated"})
+        else:
+            results.append({"action": "skipped", "reason": "no_durable_knowledge"})
 
-        if not results:
-            # No valid actions executed
-            return {"action": "skipped", "reason": "no_valid_actions"}
+    return results, deleted_count
 
-        # Summarize results
-        created = sum(1 for r in results if r.get("action") == "created")
-        updated = sum(1 for r in results if r.get("action") == "updated")
-        merged = sum(1 for r in results if r.get("action") == "merged")
 
-        if len(results) == 1:
-            return results[0]
+def _min_date(dates: "Any") -> "datetime | None":
+    """Return the minimum non-None datetime from an iterable."""
+    return min((d for d in dates if d is not None), default=None)
 
-        return {
-            "action": "multiple",
-            "created": created,
-            "updated": updated,
-            "merged": merged,
-            "total_actions": len(results),
-        }
-    finally:
-        if consolidation_span:
-            consolidation_span.end()
+
+def _max_date(dates: "Any") -> "datetime | None":
+    """Return the maximum non-None datetime from an iterable."""
+    return max((d for d in dates if d is not None), default=None)
 
 
 async def _execute_update_action(
     conn: "Connection",
     memory_engine: "MemoryEngine",
     bank_id: str,
-    memory_id: uuid.UUID,
-    action: dict[str, Any],
-    observations: list[dict[str, Any]],
+    source_memory_ids: list[uuid.UUID],
+    observation_id: str,
+    new_text: str,
+    observations: list["MemoryFact"],
     source_fact_tags: list[str] | None = None,
     source_occurred_start: datetime | None = None,
     source_occurred_end: datetime | None = None,
     source_mentioned_at: datetime | None = None,
     perf: ConsolidationPerfLog | None = None,
-) -> dict[str, Any]:
+) -> None:
     """
-    Execute an update action on an existing observation.
+    Update an existing observation.
 
-    Updates the observation text, adds to history, increments proof_count,
-    and updates temporal fields:
-    - occurred_start: uses LEAST to keep the earliest start time
-    - occurred_end: uses GREATEST to keep the most recent end time
-    - mentioned_at: uses GREATEST to keep the most recent mention time
-
-    SECURITY: Merges source fact's tags into the observation's existing tags.
-    This ensures all contributors can see the observation they contributed to.
-    For example, if Lisa's observation (tags=['user_lisa']) is updated with
-    Mike's fact (tags=['user_mike']), the observation will have both tags.
+    Extends source_memory_ids with all contributing memories, updates temporal fields
+    (LEAST for occurred_start, GREATEST for occurred_end / mentioned_at), and merges tags.
     """
-    learning_id = action.get("learning_id")
-    new_text = action.get("text")
-    reason = action.get("reason", "Updated with new fact")
-
-    if not learning_id or not new_text:
-        return {"action": "skipped", "reason": "missing_learning_id_or_text"}
-
-    # Find the observation
-    model = next((m for m in observations if str(m["id"]) == learning_id), None)
+    model = next((m for m in observations if str(m.id) == observation_id), None)
     if not model:
-        return {"action": "skipped", "reason": "learning_not_found"}
+        logger.debug(f"Update skipped: observation {observation_id} not found in recall results")
+        return
 
-    # Build history entry
-    history = list(model.get("history", []))
-    history.append(
-        {
-            "previous_text": model["text"],
-            "changed_at": datetime.now(timezone.utc).isoformat(),
-            "reason": reason,
-            "source_memory_id": str(memory_id),
-        }
-    )
+    from ...config import get_config
 
-    # Update source_memory_ids
-    source_ids = list(model.get("source_memory_ids", []))
-    source_ids.append(memory_id)
+    history_entry = {
+        "previous_text": model.text,
+        "previous_tags": list(model.tags or []),
+        "previous_occurred_start": model.occurred_start,
+        "previous_occurred_end": model.occurred_end,
+        "previous_mentioned_at": model.mentioned_at,
+        "changed_at": datetime.now(timezone.utc).isoformat(),
+        "new_source_memory_ids": [str(mid) for mid in source_memory_ids],
+    }
 
-    # SECURITY: Merge source fact's tags into existing observation tags
-    # This ensures all contributors can see the observation they contributed to
-    existing_tags = set(model.get("tags", []) or [])
+    source_ids = list(model.source_fact_ids or []) + source_memory_ids
+
+    # SECURITY: Merge source fact's tags into existing observation tags so all contributors can see it
+    existing_tags = set(model.tags or [])
     source_tags = set(source_fact_tags or [])
-    merged_tags = list(existing_tags | source_tags)  # Union of both tag sets
-    if source_tags and source_tags != existing_tags:
-        logger.debug(
-            f"Security: Merging tags for observation {learning_id}: "
-            f"existing={list(existing_tags)}, source={list(source_tags)}, merged={merged_tags}"
-        )
+    merged_tags = list(existing_tags | source_tags)
 
-    # Generate new embedding for updated text
     t0 = time.time()
     embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [new_text])
     embedding_str = str(embeddings[0]) if embeddings else None
     if perf:
         perf.record_timing("embedding", time.time() - t0)
 
-    # Update the observation
-    # - occurred_start: LEAST keeps the earliest start time across all source facts
-    # - occurred_end: GREATEST keeps the most recent end time across all source facts
-    # - mentioned_at: GREATEST keeps the most recent mention time
-    # - tags: merged from existing + source fact (for visibility)
+    config = get_config()
+    history_clause = (
+        "history = COALESCE(history, '[]'::jsonb) || $3::jsonb," if config.enable_observation_history else ""
+    )
+
     t0 = time.time()
     await conn.execute(
         f"""
         UPDATE {fq_table("memory_units")}
         SET text = $1,
             embedding = $2::vector,
-            history = $3,
+            {history_clause}
             source_memory_ids = $4,
             proof_count = $5,
             tags = $10,
@@ -626,76 +814,68 @@ async def _execute_update_action(
         """,
         new_text,
         embedding_str,
-        json.dumps(history),
+        json.dumps([history_entry]),
         source_ids,
         len(source_ids),
-        uuid.UUID(learning_id),
+        uuid.UUID(observation_id),
         source_occurred_start,
         source_occurred_end,
         source_mentioned_at,
         merged_tags,
     )
-
-    # Create links from memory to observation
-    await _create_memory_links(conn, memory_id, uuid.UUID(learning_id))
     if perf:
         perf.record_timing("db_write", time.time() - t0)
 
-    logger.debug(f"Updated observation {learning_id} with memory {memory_id}")
-
-    return {"action": "updated", "observation_id": learning_id}
+    logger.debug(f"Updated observation {observation_id} from {len(source_memory_ids)} source memories")
 
 
 async def _execute_create_action(
     conn: "Connection",
     memory_engine: "MemoryEngine",
     bank_id: str,
-    memory_id: uuid.UUID,
-    action: dict[str, Any],
+    source_memory_ids: list[uuid.UUID],
+    text: str,
     source_fact_tags: list[str] | None = None,
     event_date: datetime | None = None,
     occurred_start: datetime | None = None,
     occurred_end: datetime | None = None,
     mentioned_at: datetime | None = None,
     perf: ConsolidationPerfLog | None = None,
-) -> dict[str, Any]:
+) -> None:
     """
-    Execute a create action for a new observation.
+    Create a new observation from one or more source memories.
 
-    Creates a new observation with the specified text.
-    The text comes directly from the classify LLM - no second LLM call needed.
-
-    Tags are determined algorithmically (not by LLM):
-    - Observations always inherit their source fact's tags
-    - This ensures visibility scope is maintained (security)
+    Tags are inherited from the source facts (determined algorithmically, not by LLM)
+    to maintain visibility scope.
     """
-    text = action.get("text")
-
-    # Tags are determined algorithmically - always use source fact's tags
-    # This ensures private memories create private observations
-    tags = source_fact_tags or []
-
-    if not text:
-        return {"action": "skipped", "reason": "missing_text"}
-
-    # Use text directly from classify - skip the redundant LLM call
-    result = await _create_observation_directly(
+    await _create_observation_directly(
         conn=conn,
         memory_engine=memory_engine,
         bank_id=bank_id,
-        source_memory_id=memory_id,
-        observation_text=text,  # Text already processed by classify LLM
-        tags=tags,
+        source_memory_ids=source_memory_ids,
+        observation_text=text,
+        tags=source_fact_tags or [],
         event_date=event_date,
         occurred_start=occurred_start,
         occurred_end=occurred_end,
         mentioned_at=mentioned_at,
         perf=perf,
     )
+    logger.debug(f"Created observation from {len(source_memory_ids)} source memories")
 
-    logger.debug(f"Created observation {result.get('observation_id')} from memory {memory_id} (tags: {tags})")
 
-    return result
+async def _execute_delete_action(
+    conn: "Connection",
+    bank_id: str,
+    observation_id: str,
+) -> None:
+    """Delete a superseded or contradicted observation."""
+    await conn.execute(
+        f"DELETE FROM {fq_table('memory_units')} WHERE id = $1 AND bank_id = $2 AND fact_type = 'observation'",
+        uuid.UUID(observation_id),
+        bank_id,
+    )
+    logger.debug(f"Deleted observation {observation_id}")
 
 
 async def _create_memory_links(
@@ -723,13 +903,12 @@ async def _create_memory_links(
 
 
 async def _find_related_observations(
-    conn: "Connection",
     memory_engine: "MemoryEngine",
     bank_id: str,
     query: str,
     request_context: "RequestContext",
     tags: list[str] | None = None,
-) -> list[dict[str, Any]]:
+) -> "RecallResult":
     """
     Find observations related to the given query using optimized recall.
 
@@ -747,10 +926,9 @@ async def _find_related_observations(
     """
     # Use recall to find related observations with token budget
     # max_tokens naturally limits how many observations are returned
-    from ...config import get_config
     from ...tracing import get_tracer, is_tracing_enabled
 
-    config = get_config()
+    config = await memory_engine._config_resolver.resolve_full_config(bank_id, request_context)
 
     # SECURITY: Use all_strict matching if tags provided to prevent cross-scope consolidation
     tags_match = "all_strict" if tags else "any"
@@ -774,217 +952,124 @@ async def _find_related_observations(
             request_context=request_context,
             tags=tags,  # Filter by source memory's tags
             tags_match=tags_match,  # Use strict matching for security
+            include_source_facts=True,  # Embed source facts so we avoid a separate DB fetch
+            max_source_facts_tokens=config.consolidation_source_facts_max_tokens,
+            max_source_facts_tokens_per_observation=config.consolidation_source_facts_max_tokens_per_observation,
             _quiet=True,  # Suppress logging
         )
     finally:
         if recall_span:
             recall_span.end()
 
-    # If no observations returned, return empty list
-    if not recall_result.results:
-        return []
-
-    # Batch fetch all observations in a single query (no artificial limit)
-    observation_ids = [uuid.UUID(obs.id) for obs in recall_result.results]
-
-    rows = await conn.fetch(
-        f"""
-        SELECT id, text, proof_count, history, tags, source_memory_ids, created_at, updated_at,
-               occurred_start, occurred_end, mentioned_at
-        FROM {fq_table("memory_units")}
-        WHERE id = ANY($1) AND bank_id = $2 AND fact_type = 'observation'
-        """,
-        observation_ids,
-        bank_id,
-    )
-
-    # Build results list preserving recall order
-    id_to_row = {row["id"]: row for row in rows}
-    results = []
-
-    for obs in recall_result.results:
-        obs_id = uuid.UUID(obs.id)
-        if obs_id not in id_to_row:
-            continue
-
-        row = id_to_row[obs_id]
-        history = row["history"]
-        if isinstance(history, str):
-            history = json.loads(history)
-        elif history is None:
-            history = []
-
-        # Fetch source memories to include their text and dates
-        source_memory_ids = row["source_memory_ids"] or []
-        source_memories = []
-
-        if source_memory_ids:
-            source_rows = await conn.fetch(
-                f"""
-                SELECT text, occurred_start, occurred_end, mentioned_at, event_date
-                FROM {fq_table("memory_units")}
-                WHERE id = ANY($1) AND bank_id = $2
-                ORDER BY created_at ASC
-                LIMIT 5
-                """,
-                source_memory_ids[:5],  # Limit to first 5 source memories for token efficiency
-                bank_id,
-            )
-
-            for src_row in source_rows:
-                source_memories.append(
-                    {
-                        "text": src_row["text"],
-                        "occurred_start": src_row["occurred_start"],
-                        "occurred_end": src_row["occurred_end"],
-                        "mentioned_at": src_row["mentioned_at"],
-                        "event_date": src_row["event_date"],
-                    }
-                )
-
-        results.append(
-            {
-                "id": row["id"],
-                "text": row["text"],
-                "proof_count": row["proof_count"] or 1,
-                "tags": row["tags"] or [],
-                "source_memories": source_memories,
-                "occurred_start": row["occurred_start"],
-                "occurred_end": row["occurred_end"],
-                "mentioned_at": row["mentioned_at"],
-                "created_at": row["created_at"],
-                "updated_at": row["updated_at"],
-            }
-        )
-
-    return results
+    return recall_result
 
 
-async def _consolidate_with_llm(
-    memory_engine: "MemoryEngine",
-    fact_text: str,
-    observations: list[dict[str, Any]],
-    mission: str,
+def _build_observations_for_llm(
+    observations: "list[MemoryFact]",
+    source_facts: "dict[str, MemoryFact]",
 ) -> list[dict[str, Any]]:
-    """
-    Single LLM call to extract durable knowledge and decide on consolidation actions.
+    """Serialize MemoryFact observations into dicts for the consolidation LLM prompt."""
+    obs_list = []
+    for obs in observations:
+        obs_data: dict[str, Any] = {
+            "id": obs.id,
+            "text": obs.text,
+            "proof_count": len(obs.source_fact_ids or []) or 1,
+        }
+        if obs.occurred_start:
+            obs_data["occurred_start"] = obs.occurred_start
+        if obs.occurred_end:
+            obs_data["occurred_end"] = obs.occurred_end
+        if obs.mentioned_at:
+            obs_data["mentioned_at"] = obs.mentioned_at
+        source_memories = []
+        for sid in obs.source_fact_ids or []:
+            sf = source_facts.get(sid)
+            if sf is None:
+                continue
+            sf_data: dict[str, Any] = {"text": sf.text}
+            if sf.context:
+                sf_data["context"] = sf.context
+            if sf.occurred_start:
+                sf_data["occurred_start"] = sf.occurred_start
+            if sf.occurred_end:
+                sf_data["occurred_end"] = sf.occurred_end
+            if sf.mentioned_at:
+                sf_data["mentioned_at"] = sf.mentioned_at
+            source_memories.append(sf_data)
+        if source_memories:
+            obs_data["source_memories"] = source_memories
+        obs_list.append(obs_data)
+    return obs_list
 
-    This handles ALL cases:
-    - No related observations: extracts durable knowledge, returns create action
-    - Related observations exist: compares and returns update/create actions
-    - Purely ephemeral fact: returns empty array
 
-    Note: Tags are NOT handled by the LLM. They are determined algorithmically:
-    - CREATE: observation inherits source fact's tags
-    - UPDATE: observation merges source fact's tags with existing tags
-
-    Returns:
-        List of actions, each being:
-        - {"action": "update", "learning_id": "uuid", "text": "...", "reason": "..."}
-        - {"action": "create", "text": "...", "reason": "..."}
-        - [] if fact is purely ephemeral (no durable knowledge)
-    """
-    # Format observations as JSON with source memories and dates
-    if observations:
-        obs_list = []
-        for obs in observations:
-            obs_data = {
-                "id": str(obs["id"]),
-                "text": obs["text"],
-                "proof_count": obs["proof_count"],
-                "tags": obs["tags"],
-                "created_at": obs["created_at"].isoformat() if obs.get("created_at") else None,
-                "updated_at": obs["updated_at"].isoformat() if obs.get("updated_at") else None,
-            }
-
-            # Include temporal info if available
-            if obs.get("occurred_start"):
-                obs_data["occurred_start"] = obs["occurred_start"].isoformat()
-            if obs.get("occurred_end"):
-                obs_data["occurred_end"] = obs["occurred_end"].isoformat()
-            if obs.get("mentioned_at"):
-                obs_data["mentioned_at"] = obs["mentioned_at"].isoformat()
-
-            # Include source memories (up to 3 for brevity)
-            if obs.get("source_memories"):
-                obs_data["source_memories"] = [
-                    {
-                        "text": sm["text"],
-                        "event_date": sm["event_date"].isoformat() if sm.get("event_date") else None,
-                        "occurred_start": sm["occurred_start"].isoformat() if sm.get("occurred_start") else None,
-                    }
-                    for sm in obs["source_memories"][:3]  # Limit to 3 for token efficiency
-                ]
-
-            obs_list.append(obs_data)
-
+async def _consolidate_batch_with_llm(
+    llm_config: Any,
+    memories: list[dict[str, Any]],
+    union_observations: "list[MemoryFact]",
+    union_source_facts: "dict[str, MemoryFact]",
+    config: Any = None,
+) -> _BatchLLMResult:
+    """Single LLM call for a batch of facts against a pooled set of observations."""
+    if union_observations:
+        obs_list = _build_observations_for_llm(union_observations, union_source_facts)
         observations_text = json.dumps(obs_list, indent=2)
     else:
         observations_text = "[]"
 
-    # Only include mission section if mission is set and not the default
-    mission_section = ""
-    if mission and mission != "General memory consolidation":
-        mission_section = f"""
-MISSION CONTEXT: {mission}
+    def _fact_line(m: dict[str, Any]) -> str:
+        text = f"[{m['id']}] {m['text']}"
+        temporal_parts = []
+        if m.get("occurred_start"):
+            temporal_parts.append(f"occurred_start={m['occurred_start']}")
+        if m.get("occurred_end"):
+            temporal_parts.append(f"occurred_end={m['occurred_end']}")
+        if m.get("mentioned_at"):
+            temporal_parts.append(f"mentioned_at={m['mentioned_at']}")
+        if temporal_parts:
+            text += f" ({', '.join(temporal_parts)})"
+        return text
 
-Focus on DURABLE knowledge that serves this mission, not ephemeral state.
-"""
+    facts_lines = "\n".join(_fact_line(m) for m in memories)
 
-    user_prompt = CONSOLIDATION_USER_PROMPT.format(
-        mission_section=mission_section,
-        fact_text=fact_text,
+    observations_mission = config.observations_mission if config is not None else None
+    prompt_template = build_batch_consolidation_prompt(observations_mission)
+    prompt = prompt_template.format(
+        facts_text=facts_lines,
         observations_text=observations_text,
     )
 
-    messages = [
-        {"role": "system", "content": CONSOLIDATION_SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
+    max_attempts = 3
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response: _ConsolidationBatchResponse = await llm_config.call(
+                messages=[{"role": "user", "content": prompt}],
+                response_format=_ConsolidationBatchResponse,
+                scope="consolidation",
+            )
+            return _BatchLLMResult(
+                creates=response.creates,
+                updates=response.updates,
+                deletes=response.deletes,
+                obs_count=len(union_observations),
+                prompt_chars=len(prompt),
+            )
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(f"[CONSOLIDATION] LLM batch call failed (attempt {attempt}/{max_attempts}): {exc}")
 
-    try:
-        result = await memory_engine._consolidation_llm_config.call(
-            messages=messages,
-            skip_validation=True,  # Raw JSON response
-            scope="consolidation",
-        )
-        # Parse JSON response - should be an array
-        if isinstance(result, str):
-            # Strip markdown code fences (some models wrap JSON in ```json ... ```)
-            clean = result.strip()
-            if clean.startswith("```"):
-                clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
-                if clean.endswith("```"):
-                    clean = clean[:-3]
-                clean = clean.strip()
-            result = json.loads(clean)
-        # Ensure result is a list
-        if isinstance(result, list):
-            return result
-        # Handle legacy single-action format for backward compatibility
-        if isinstance(result, dict):
-            if result.get("related_ids") and result.get("consolidated_text"):
-                # Convert old format to new format
-                return [
-                    {
-                        "action": "update",
-                        "learning_id": result["related_ids"][0],
-                        "text": result["consolidated_text"],
-                        "reason": result.get("reason", ""),
-                    }
-                ]
-            return []
-        return []
-    except Exception as e:
-        logger.warning(f"Error in consolidation LLM call: {e}")
-        return []
+    logger.error(
+        f"[CONSOLIDATION] LLM batch call failed after {max_attempts} attempts, skipping batch. Last error: {last_exc}"
+    )
+    return _BatchLLMResult(obs_count=len(union_observations), prompt_chars=len(prompt))
 
 
 async def _create_observation_directly(
     conn: "Connection",
     memory_engine: "MemoryEngine",
     bank_id: str,
-    source_memory_id: uuid.UUID,
+    source_memory_ids: list[uuid.UUID],
     observation_text: str,
     tags: list[str] | None = None,
     event_date: datetime | None = None,
@@ -993,12 +1078,7 @@ async def _create_observation_directly(
     mentioned_at: datetime | None = None,
     perf: ConsolidationPerfLog | None = None,
 ) -> dict[str, Any]:
-    """
-    Create an observation directly with pre-processed text (no LLM call).
-
-    Used when the classify LLM has already provided the learning text.
-    This avoids the redundant second LLM call.
-    """
+    """Create an observation from one or more source memories with pre-processed text."""
     # Generate embedding for the observation (convert to string for pgvector)
     t0 = time.time()
     embeddings = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [observation_text])
@@ -1009,8 +1089,8 @@ async def _create_observation_directly(
     # Create the observation as a memory_unit
     now = datetime.now(timezone.utc)
     obs_event_date = event_date or now
-    obs_occurred_start = occurred_start or now
-    obs_occurred_end = occurred_end or now
+    obs_occurred_start = occurred_start
+    obs_occurred_end = occurred_end
     obs_mentioned_at = mentioned_at or now
     obs_tags = tags or []
 
@@ -1048,7 +1128,7 @@ async def _create_observation_directly(
         bank_id,
         observation_text,
         embedding_str,
-        [source_memory_id],
+        source_memory_ids,
         obs_tags,
         obs_event_date,
         obs_occurred_start,
@@ -1056,11 +1136,9 @@ async def _create_observation_directly(
         obs_mentioned_at,
     )
 
-    # Create links between memory and observation (includes entity links, memory_links)
-    await _create_memory_links(conn, source_memory_id, observation_id)
     if perf:
         perf.record_timing("db_write", time.time() - t0)
 
-    logger.debug(f"Created observation {observation_id} from memory {source_memory_id} (tags: {obs_tags})")
+    logger.debug(f"Created observation {observation_id} from {len(source_memory_ids)} memories (tags: {obs_tags})")
 
     return {"action": "created", "observation_id": str(row["id"]), "tags": obs_tags}

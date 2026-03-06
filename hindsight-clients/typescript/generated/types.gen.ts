@@ -252,6 +252,24 @@ export type BankStatsResponse = {
 };
 
 /**
+ * Body_file_retain
+ */
+export type BodyFileRetain = {
+  /**
+   * Files
+   *
+   * Files to upload and convert
+   */
+  files: Array<Blob | File>;
+  /**
+   * Request
+   *
+   * JSON string with FileRetainRequest model
+   */
+  request: string;
+};
+
+/**
  * Budget
  *
  * Budget levels for recall/reflect operations.
@@ -276,6 +294,34 @@ export type CancelOperationResponse = {
    * Operation Id
    */
   operation_id: string;
+};
+
+/**
+ * ChildOperationStatus
+ *
+ * Status of a child operation (for batch operations).
+ */
+export type ChildOperationStatus = {
+  /**
+   * Operation Id
+   */
+  operation_id: string;
+  /**
+   * Status
+   */
+  status: string;
+  /**
+   * Sub Batch Index
+   */
+  sub_batch_index?: number | null;
+  /**
+   * Items Count
+   */
+  items_count?: number | null;
+  /**
+   * Error Message
+   */
+  error_message?: string | null;
 };
 
 /**
@@ -351,6 +397,18 @@ export type ChunkResponse = {
 };
 
 /**
+ * ClearMemoryObservationsResponse
+ *
+ * Response model for clearing observations for a specific memory.
+ */
+export type ClearMemoryObservationsResponse = {
+  /**
+   * Deleted Count
+   */
+  deleted_count: number;
+};
+
+/**
  * ConsolidationResponse
  *
  * Response model for consolidation trigger endpoint.
@@ -378,21 +436,86 @@ export type ConsolidationResponse = {
 export type CreateBankRequest = {
   /**
    * Name
+   *
+   * Deprecated: display label only, not advertised
    */
   name?: string | null;
+  /**
+   * Deprecated: use update_bank_config instead
+   */
   disposition?: DispositionTraits | null;
+  /**
+   * Disposition Skepticism
+   *
+   * Deprecated: use update_bank_config instead
+   */
+  disposition_skepticism?: number | null;
+  /**
+   * Disposition Literalism
+   *
+   * Deprecated: use update_bank_config instead
+   */
+  disposition_literalism?: number | null;
+  /**
+   * Disposition Empathy
+   *
+   * Deprecated: use update_bank_config instead
+   */
+  disposition_empathy?: number | null;
   /**
    * Mission
    *
-   * The agent's mission
+   * Deprecated: use update_bank_config with reflect_mission instead
    */
   mission?: string | null;
   /**
    * Background
    *
-   * Deprecated: use mission instead
+   * Deprecated: use update_bank_config with reflect_mission instead
    */
   background?: string | null;
+  /**
+   * Reflect Mission
+   *
+   * Mission/context for Reflect operations. Guides how Reflect interprets and uses memories.
+   */
+  reflect_mission?: string | null;
+  /**
+   * Retain Mission
+   *
+   * Steers what gets extracted during retain(). Injected alongside built-in extraction rules.
+   */
+  retain_mission?: string | null;
+  /**
+   * Retain Extraction Mode
+   *
+   * Fact extraction mode: 'concise' (default), 'verbose', or 'custom'.
+   */
+  retain_extraction_mode?: string | null;
+  /**
+   * Retain Custom Instructions
+   *
+   * Custom extraction prompt. Only active when retain_extraction_mode is 'custom'.
+   */
+  retain_custom_instructions?: string | null;
+  /**
+   * Retain Chunk Size
+   *
+   * Maximum token size for each content chunk during retain.
+   */
+  retain_chunk_size?: number | null;
+  /**
+   * Enable Observations
+   *
+   * Toggle automatic observation consolidation after retain().
+   */
+  enable_observations?: boolean | null;
+  /**
+   * Observations Mission
+   *
+   * Controls what gets synthesised into observations. Replaces built-in consolidation rules entirely.
+   */
+  observations_mission?: string | null;
 };
 
 /**
@@ -493,6 +616,42 @@ export type CreateMentalModelResponse = {
    * Operation ID to track refresh progress
    */
   operation_id: string;
+};
+
+/**
+ * CreateWebhookRequest
+ *
+ * Request model for registering a webhook.
+ */
+export type CreateWebhookRequest = {
+  /**
+   * Url
+   *
+   * HTTP(S) endpoint URL to deliver events to
+   */
+  url: string;
+  /**
+   * Secret
+   *
+   * HMAC-SHA256 signing secret (optional)
+   */
+  secret?: string | null;
+  /**
+   * Event Types
+   *
+   * List of event types to deliver. Currently supported: 'consolidation.completed'
+   */
+  event_types?: Array<string>;
+  /**
+   * Enabled
+   *
+   * Whether this webhook is active
+   */
+  enabled?: boolean;
+  /**
+   * HTTP delivery configuration (method, timeout, headers, params)
+   */
+  http_config?: WebhookHttpConfig;
 };
 
 /**
@@ -868,6 +1027,26 @@ export type FeaturesInfo = {
    * Whether per-bank configuration API is enabled
    */
   bank_config_api: boolean;
+  /**
+   * File Upload Api
+   *
+   * Whether file upload/conversion API is enabled
+   */
+  file_upload_api: boolean;
+};
+
+/**
+ * FileRetainResponse
+ *
+ * Response model for file upload endpoint.
+ */
+export type FileRetainResponse = {
+  /**
+   * Operation Ids
+   *
+   * Operation IDs for tracking file conversion operations. Use GET /v1/default/banks/{bank_id}/operations to list operations.
+   */
+  operation_ids: Array<string>;
 };
 
 /**
@@ -928,6 +1107,10 @@ export type IncludeOptions = {
    * Include raw chunks. Set to {} to enable, null to disable (default: disabled).
    */
   chunks?: ChunkIncludeOptions | null;
+  /**
+   * Include source facts for observation-type results. Set to {} to enable, null to disable (default: disabled).
+   */
+  source_facts?: SourceFactsIncludeOptions | null;
 };
 
 /**
@@ -1018,6 +1201,8 @@ export type MemoryItem = {
   content: string;
   /**
    * Timestamp
+   *
+   * When the content occurred. Accepts an ISO 8601 datetime string (e.g. '2024-01-15T10:30:00Z'), null/omitted (defaults to now), or the special string 'unset' to explicitly store without any timestamp (use this for timeless content such as fictional documents or static reference material).
    */
   timestamp?: string | null;
   /**
@@ -1048,6 +1233,17 @@ export type MemoryItem = {
    * Optional tags for visibility scoping. Memories with tags can be filtered during recall.
    */
   tags?: Array<string> | null;
+  /**
+   * ObservationScopes
+   *
+   * How to scope observations during consolidation. 'per_tag' runs one consolidation pass per individual tag, creating separate observations for each tag. 'combined' (default) runs a single pass with all tags together. A list of tag lists runs one pass per inner list, giving full control over which combinations to use.
+   */
+  observation_scopes?:
+    | "per_tag"
+    | "combined"
+    | "all_combinations"
+    | Array<Array<string>>
+    | null;
 };
 
 /**
@@ -1201,6 +1397,20 @@ export type OperationStatusResponse = {
    * Error Message
    */
   error_message?: string | null;
+  /**
+   * Result Metadata
+   *
+   * Internal metadata for debugging. Structure may change without notice. Not for production use.
+   */
+  result_metadata?: {
+    [key: string]: unknown;
+  } | null;
+  /**
+   * Child Operations
+   *
+   * Child operations for batch operations (if applicable)
+   */
+  child_operations?: Array<ChildOperationStatus> | null;
 };
 
 /**
@@ -1312,6 +1522,14 @@ export type RecallResponse = {
   chunks?: {
     [key: string]: ChunkData;
   } | null;
+  /**
+   * Source Facts
+   *
+   * Source facts for observation-type results, keyed by fact ID
+   */
+  source_facts?: {
+    [key: string]: RecallResult;
+  } | null;
 };
 
 /**
@@ -1370,6 +1588,10 @@ export type RecallResult = {
    * Tags
    */
   tags?: Array<string> | null;
+  /**
+   * Source Fact Ids
+   */
+  source_fact_ids?: Array<string> | null;
 };
 
 /**
@@ -1686,7 +1908,9 @@ export type RetainRequest = {
   /**
    * Document Tags
    *
-   * Tags applied to all items in this request. These are merged with any item-level tags.
+   * Deprecated. Use item-level tags instead.
+   *
+   * @deprecated
    */
   document_tags?: Array<string> | null;
 };
@@ -1718,13 +1942,33 @@ export type RetainResponse = {
   /**
    * Operation Id
    *
-   * Operation ID for tracking async operations. Use GET /v1/default/banks/{bank_id}/operations to list operations and find this ID. Only present when async=true.
+   * Operation ID for tracking async operations. Use GET /v1/default/banks/{bank_id}/operations to list operations. Only present when async=true.
    */
   operation_id?: string | null;
   /**
    * Token usage metrics for LLM calls during fact extraction (only present for synchronous operations)
    */
   usage?: TokenUsage | null;
+};
+
+/**
+ * SourceFactsIncludeOptions
+ *
+ * Options for including source facts for observation-type results.
+ */
+export type SourceFactsIncludeOptions = {
+  /**
+   * Max Tokens
+   *
+   * Maximum total tokens for source facts across all observations (-1 = unlimited)
+   */
+  max_tokens?: number;
+  /**
+   * Max Tokens Per Observation
+   *
+   * Maximum tokens of source facts per observation (-1 = unlimited)
+   */
+  max_tokens_per_observation?: number;
 };
 
 /**
@@ -1874,6 +2118,42 @@ export type UpdateMentalModelRequest = {
 };
 
 /**
+ * UpdateWebhookRequest
+ *
+ * Request model for updating a webhook. Only provided fields are updated.
+ */
+export type UpdateWebhookRequest = {
+  /**
+   * Url
+   *
+   * HTTP(S) endpoint URL
+   */
+  url?: string | null;
+  /**
+   * Secret
+   *
+   * HMAC-SHA256 signing secret. Omit to keep existing; send null to clear.
+   */
+  secret?: string | null;
+  /**
+   * Event Types
+   *
+   * List of event types
+   */
+  event_types?: Array<string> | null;
+  /**
+   * Enabled
+   *
+   * Whether this webhook is active
+   */
+  enabled?: boolean | null;
+  /**
+   * HTTP delivery configuration
+   */
+  http_config?: WebhookHttpConfig | null;
+};
+
+/**
  * ValidationError
  */
 export type ValidationError = {
@@ -1907,6 +2187,173 @@ export type VersionResponse = {
    * Enabled feature flags
    */
   features: FeaturesInfo;
+};
+
+/**
+ * WebhookDeliveryListResponse
+ *
+ * Response model for listing webhook deliveries.
+ */
+export type WebhookDeliveryListResponse = {
+  /**
+   * Items
+   */
+  items: Array<WebhookDeliveryResponse>;
+  /**
+   * Next Cursor
+   */
+  next_cursor?: string | null;
+};
+
+/**
+ * WebhookDeliveryResponse
+ *
+ * Response model for a webhook delivery record.
+ */
+export type WebhookDeliveryResponse = {
+  /**
+   * Id
+   */
+  id: string;
+  /**
+   * Webhook Id
+   */
+  webhook_id: string | null;
+  /**
+   * Url
+   */
+  url: string;
+  /**
+   * Event Type
+   */
+  event_type: string;
+  /**
+   * Status
+   */
+  status: string;
+  /**
+   * Attempts
+   */
+  attempts: number;
+  /**
+   * Next Retry At
+   */
+  next_retry_at?: string | null;
+  /**
+   * Last Error
+   */
+  last_error?: string | null;
+  /**
+   * Last Response Status
+   */
+  last_response_status?: number | null;
+  /**
+   * Last Response Body
+   */
+  last_response_body?: string | null;
+  /**
+   * Last Attempt At
+   */
+  last_attempt_at?: string | null;
+  /**
+   * Created At
+   */
+  created_at?: string | null;
+  /**
+   * Updated At
+   */
+  updated_at?: string | null;
+};
+
+/**
+ * WebhookHttpConfig
+ *
+ * HTTP delivery configuration for a webhook.
+ */
+export type WebhookHttpConfig = {
+  /**
+   * Method
+   *
+   * HTTP method: GET or POST
+   */
+  method?: string;
+  /**
+   * Timeout Seconds
+   *
+   * HTTP request timeout in seconds
+   */
+  timeout_seconds?: number;
+  /**
+   * Headers
+   *
+   * Custom HTTP headers
+   */
+  headers?: {
+    [key: string]: string;
+  };
+  /**
+   * Params
+   *
+   * Custom HTTP query parameters
+   */
+  params?: {
+    [key: string]: string;
+  };
+};
+
+/**
+ * WebhookListResponse
+ *
+ * Response model for listing webhooks.
+ */
+export type WebhookListResponse = {
+  /**
+   * Items
+   */
+  items: Array<WebhookResponse>;
+};
+
+/**
+ * WebhookResponse
+ *
+ * Response model for a webhook.
+ */
+export type WebhookResponse = {
+  /**
+   * Id
+   */
+  id: string;
+  /**
+   * Bank Id
+   */
+  bank_id: string | null;
+  /**
+   * Url
+   */
+  url: string;
+  /**
+   * Secret
+   *
+   * Signing secret (redacted in responses)
+   */
+  secret?: string | null;
+  /**
+   * Event Types
+   */
+  event_types: Array<string>;
+  /**
+   * Enabled
+   */
+  enabled: boolean;
+  http_config?: WebhookHttpConfig;
+  /**
+   * Created At
+   */
+  created_at?: string | null;
+  /**
+   * Updated At
+   */
+  updated_at?: string | null;
 };
 
 export type HealthEndpointHealthGetData = {
@@ -1976,6 +2423,18 @@ export type GetGraphData = {
      * Limit
      */
     limit?: number;
+    /**
+     * Q
+     */
+    q?: string | null;
+    /**
+     * Tags
+     */
+    tags?: Array<string> | null;
+    /**
+     * Tags Match
+     */
+    tags_match?: string;
   };
   url: "/v1/default/banks/{bank_id}/graph";
 };
@@ -2084,6 +2543,45 @@ export type GetMemoryErrors = {
 export type GetMemoryError = GetMemoryErrors[keyof GetMemoryErrors];
 
 export type GetMemoryResponses = {
+  /**
+   * Successful Response
+   */
+  200: unknown;
+};
+
+export type GetObservationHistoryData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Memory Id
+     */
+    memory_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/memories/{memory_id}/history";
+};
+
+export type GetObservationHistoryErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetObservationHistoryError =
+  GetObservationHistoryErrors[keyof GetObservationHistoryErrors];
+
+export type GetObservationHistoryResponses = {
   /**
    * Successful Response
    */
@@ -2584,6 +3082,45 @@ export type UpdateMentalModelResponses = {
 export type UpdateMentalModelResponse =
   UpdateMentalModelResponses[keyof UpdateMentalModelResponses];
 
+export type GetMentalModelHistoryData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Mental Model Id
+     */
+    mental_model_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/history";
+};
+
+export type GetMentalModelHistoryErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetMentalModelHistoryError =
+  GetMentalModelHistoryErrors[keyof GetMentalModelHistoryErrors];
+
+export type GetMentalModelHistoryResponses = {
+  /**
+   * Successful Response
+   */
+  200: unknown;
+};
+
 export type RefreshMentalModelData = {
   body?: never;
   headers?: {
@@ -2868,8 +3405,22 @@ export type ListDocumentsData = {
   query?: {
     /**
      * Q
+     *
+     * Case-insensitive substring filter on document ID (e.g. 'report' matches 'report-2024')
      */
     q?: string | null;
+    /**
+     * Tags
+     *
+     * Filter documents by tags
+     */
+    tags?: Array<string> | null;
+    /**
+     * Tags Match
+     *
+     * How to match tags: 'any', 'all', 'any_strict', 'all_strict'
+     */
+    tags_match?: string;
     /**
      * Limit
      */
@@ -3478,6 +4029,48 @@ export type ClearObservationsResponses = {
 export type ClearObservationsResponse =
   ClearObservationsResponses[keyof ClearObservationsResponses];
 
+export type ClearMemoryObservationsData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Memory Id
+     */
+    memory_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/memories/{memory_id}/observations";
+};
+
+export type ClearMemoryObservationsErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type ClearMemoryObservationsError =
+  ClearMemoryObservationsErrors[keyof ClearMemoryObservationsErrors];
+
+export type ClearMemoryObservationsResponses = {
+  /**
+   * Successful Response
+   */
+  200: ClearMemoryObservationsResponse;
+};
+
+export type ClearMemoryObservationsResponse2 =
+  ClearMemoryObservationsResponses[keyof ClearMemoryObservationsResponses];
+
 export type ResetBankConfigData = {
   body?: never;
   headers?: {
@@ -3629,6 +4222,217 @@ export type TriggerConsolidationResponses = {
 export type TriggerConsolidationResponse =
   TriggerConsolidationResponses[keyof TriggerConsolidationResponses];
 
+export type ListWebhooksData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/webhooks";
+};
+
+export type ListWebhooksErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type ListWebhooksError = ListWebhooksErrors[keyof ListWebhooksErrors];
+
+export type ListWebhooksResponses = {
+  /**
+   * Successful Response
+   */
+  200: WebhookListResponse;
+};
+
+export type ListWebhooksResponse =
+  ListWebhooksResponses[keyof ListWebhooksResponses];
+
+export type CreateWebhookData = {
+  body: CreateWebhookRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/webhooks";
+};
+
+export type CreateWebhookErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type CreateWebhookError = CreateWebhookErrors[keyof CreateWebhookErrors];
+
+export type CreateWebhookResponses = {
+  /**
+   * Successful Response
+   */
+  201: WebhookResponse;
+};
+
+export type CreateWebhookResponse =
+  CreateWebhookResponses[keyof CreateWebhookResponses];
+
+export type DeleteWebhookData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Webhook Id
+     */
+    webhook_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/webhooks/{webhook_id}";
+};
+
+export type DeleteWebhookErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type DeleteWebhookError = DeleteWebhookErrors[keyof DeleteWebhookErrors];
+
+export type DeleteWebhookResponses = {
+  /**
+   * Successful Response
+   */
+  200: DeleteResponse;
+};
+
+export type DeleteWebhookResponse =
+  DeleteWebhookResponses[keyof DeleteWebhookResponses];
+
+export type UpdateWebhookData = {
+  body: UpdateWebhookRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Webhook Id
+     */
+    webhook_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/webhooks/{webhook_id}";
+};
+
+export type UpdateWebhookErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type UpdateWebhookError = UpdateWebhookErrors[keyof UpdateWebhookErrors];
+
+export type UpdateWebhookResponses = {
+  /**
+   * Successful Response
+   */
+  200: WebhookResponse;
+};
+
+export type UpdateWebhookResponse =
+  UpdateWebhookResponses[keyof UpdateWebhookResponses];
+
+export type ListWebhookDeliveriesData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Webhook Id
+     */
+    webhook_id: string;
+  };
+  query?: {
+    /**
+     * Limit
+     *
+     * Maximum number of deliveries to return
+     */
+    limit?: number;
+    /**
+     * Cursor
+     *
+     * Pagination cursor (created_at of last item)
+     */
+    cursor?: string | null;
+  };
+  url: "/v1/default/banks/{bank_id}/webhooks/{webhook_id}/deliveries";
+};
+
+export type ListWebhookDeliveriesErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type ListWebhookDeliveriesError =
+  ListWebhookDeliveriesErrors[keyof ListWebhookDeliveriesErrors];
+
+export type ListWebhookDeliveriesResponses = {
+  /**
+   * Successful Response
+   */
+  200: WebhookDeliveryListResponse;
+};
+
+export type ListWebhookDeliveriesResponse =
+  ListWebhookDeliveriesResponses[keyof ListWebhookDeliveriesResponses];
+
 export type ClearBankMemoriesData = {
   body?: never;
   headers?: {
@@ -3711,3 +4515,40 @@ export type RetainMemoriesResponses = {
 
 export type RetainMemoriesResponse =
   RetainMemoriesResponses[keyof RetainMemoriesResponses];
+
+export type FileRetainData = {
+  body: BodyFileRetain;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/files/retain";
+};
+
+export type FileRetainErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type FileRetainError = FileRetainErrors[keyof FileRetainErrors];
+
+export type FileRetainResponses = {
+  /**
+   * Successful Response
+   */
+  200: FileRetainResponse;
+};
+
+export type FileRetainResponse2 =
+  FileRetainResponses[keyof FileRetainResponses];

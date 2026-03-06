@@ -7,6 +7,7 @@ Coordinates all retain pipeline modules to store memories efficiently.
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -52,10 +53,11 @@ def parse_datetime_flexible(value: Any) -> datetime:
         raise TypeError(f"Expected datetime or string, got {type(value).__name__}")
 
 
+import asyncpg
+
 from ..response_models import TokenUsage
 from . import (
     chunk_storage,
-    deduplication,
     embedding_processing,
     entity_processing,
     fact_extraction,
@@ -73,7 +75,6 @@ async def retain_batch(
     llm_config,
     entity_resolver,
     format_date_fn,
-    duplicate_checker_fn,
     bank_id: str,
     contents_dicts: list[RetainContentDict],
     config,
@@ -82,6 +83,9 @@ async def retain_batch(
     fact_type_override: str | None = None,
     confidence_score: float | None = None,
     document_tags: list[str] | None = None,
+    operation_id: str | None = None,
+    schema: str | None = None,
+    outbox_callback: Callable[["asyncpg.Connection"], Awaitable[None]] | None = None,
 ) -> tuple[list[list[str]], TokenUsage]:
     """
     Process a batch of content through the retain pipeline.
@@ -92,7 +96,6 @@ async def retain_batch(
         llm_config: LLM configuration for fact extraction
         entity_resolver: Entity resolver for entity processing
         format_date_fn: Function to format datetime to readable string
-        duplicate_checker_fn: Function to check for duplicate facts
         bank_id: Bank identifier
         contents_dicts: List of content dictionaries
         config: Resolved HindsightConfig for this bank
@@ -126,12 +129,14 @@ async def retain_batch(
         item_tags = item.get("tags", []) or []
         merged_tags = list(set(item_tags + (document_tags or [])))
 
-        # Handle event_date: parse flexibly (handles both datetime objects and ISO strings)
-        event_date_value = item.get("event_date")
-        if event_date_value:
-            event_date_value = parse_datetime_flexible(event_date_value)
+        # Handle event_date: distinguish "not provided" (default to now) from
+        # "explicitly None" (caller opted into no timestamp).
+        if "event_date" in item and item["event_date"] is None:
+            event_date_value = None  # Caller explicitly signalled "unknown date"
+        elif item.get("event_date"):
+            event_date_value = parse_datetime_flexible(item["event_date"])
         else:
-            event_date_value = utcnow()
+            event_date_value = utcnow()  # Backward-compatible default
 
         content = RetainContent(
             content=item["content"],
@@ -141,6 +146,7 @@ async def retain_batch(
             entities=item.get("entities", []),
             content_type=item.get("content_type", "auto"),
             tags=merged_tags,
+            observation_scopes=item.get("observation_scopes"),
         )
         contents.append(content)
 
@@ -148,20 +154,27 @@ async def retain_batch(
     step_start = time.time()
 
     extracted_facts, chunks, usage = await fact_extraction.extract_facts_from_contents(
-        contents, llm_config, agent_name, config
+        contents, llm_config, agent_name, config, pool, operation_id, schema
     )
     log_buffer.append(
         f"[1] Extract facts: {len(extracted_facts)} facts, {len(chunks)} chunks from {len(contents)} contents in {time.time() - step_start:.3f}s"
     )
 
     if not extracted_facts:
-        # Still need to create document if document_id was provided
+        # Still need to create document if document_id was provided or chunks exist
+        from collections import defaultdict
+
+        docs_tracked = 0
         async with acquire_with_retry(pool) as conn:
             async with conn.transaction():
-                await fact_storage.ensure_bank_exists(conn, bank_id)
+                # Group contents by document_id (consistent with normal path)
+                contents_by_doc_early = defaultdict(list)
+                for idx, content_dict in enumerate(contents_dicts):
+                    doc_id = content_dict.get("document_id")
+                    contents_by_doc_early[doc_id].append((idx, content_dict))
 
-                # Handle document tracking even with no facts
                 if document_id:
+                    # Legacy: single document_id parameter
                     combined_content = "\n".join([c.get("content", "") for c in contents_dicts])
                     # Collect tags from all content items and merge with document_tags
                     all_tags = set(document_tags or [])
@@ -186,45 +199,57 @@ async def retain_batch(
                     await fact_storage.handle_document_tracking(
                         conn, bank_id, document_id, combined_content, is_first_batch, retain_params, merged_tags
                     )
+                    docs_tracked += 1
                 else:
-                    # Check for per-item document_ids
-                    from collections import defaultdict
+                    # Handle per-item document_ids and/or chunks (mirrors normal path logic)
+                    has_any_doc_ids = any(item.get("document_id") for item in contents_dicts)
 
-                    contents_by_doc = defaultdict(list)
-                    for idx, content_dict in enumerate(contents_dicts):
-                        doc_id = content_dict.get("document_id")
-                        if doc_id:
-                            contents_by_doc[doc_id].append((idx, content_dict))
+                    if has_any_doc_ids or chunks:
+                        for original_doc_id, doc_contents in contents_by_doc_early.items():
+                            should_create_doc = (original_doc_id is not None) or chunks
+                            if not should_create_doc:
+                                continue
 
-                    for doc_id, doc_contents in contents_by_doc.items():
-                        combined_content = "\n".join([c.get("content", "") for _, c in doc_contents])
-                        # Collect tags from all content items for this document and merge with document_tags
-                        all_tags = set(document_tags or [])
-                        for _, item in doc_contents:
-                            item_tags = item.get("tags", []) or []
-                            all_tags.update(item_tags)
-                        merged_tags = list(all_tags)
+                            actual_doc_id = original_doc_id
+                            if actual_doc_id is None:
+                                # No document_id but have chunks - generate one
+                                actual_doc_id = str(uuid.uuid4())
 
-                        retain_params = {}
-                        if doc_contents:
-                            first_item = doc_contents[0][1]
-                            if first_item.get("context"):
-                                retain_params["context"] = first_item["context"]
-                            if first_item.get("event_date"):
-                                retain_params["event_date"] = (
-                                    first_item["event_date"].isoformat()
-                                    if hasattr(first_item["event_date"], "isoformat")
-                                    else str(first_item["event_date"])
-                                )
-                            if first_item.get("metadata"):
-                                retain_params["metadata"] = first_item["metadata"]
-                        await fact_storage.handle_document_tracking(
-                            conn, bank_id, doc_id, combined_content, is_first_batch, retain_params, merged_tags
-                        )
+                            combined_content = "\n".join([c.get("content", "") for _, c in doc_contents])
+                            all_tags = set(document_tags or [])
+                            for _, item in doc_contents:
+                                item_tags = item.get("tags", []) or []
+                                all_tags.update(item_tags)
+                            merged_tags = list(all_tags)
+
+                            retain_params = {}
+                            if doc_contents:
+                                first_item = doc_contents[0][1]
+                                if first_item.get("context"):
+                                    retain_params["context"] = first_item["context"]
+                                if first_item.get("event_date"):
+                                    retain_params["event_date"] = (
+                                        first_item["event_date"].isoformat()
+                                        if hasattr(first_item["event_date"], "isoformat")
+                                        else str(first_item["event_date"])
+                                    )
+                                if first_item.get("metadata"):
+                                    retain_params["metadata"] = first_item["metadata"]
+                            await fact_storage.handle_document_tracking(
+                                conn,
+                                bank_id,
+                                actual_doc_id,
+                                combined_content,
+                                is_first_batch,
+                                retain_params,
+                                merged_tags,
+                            )
+                            docs_tracked += 1
 
         total_time = time.time() - start_time
+        doc_status = f"{docs_tracked} document(s) tracked" if docs_tracked > 0 else "no document tracked"
         logger.info(
-            f"RETAIN_BATCH COMPLETE: 0 facts extracted from {len(contents)} contents in {total_time:.3f}s (document tracked, no facts)"
+            f"RETAIN_BATCH COMPLETE: 0 facts extracted from {len(contents)} contents in {total_time:.3f}s ({doc_status}, no facts)"
         )
         return [[] for _ in contents], usage
 
@@ -259,9 +284,6 @@ async def retain_batch(
     # Step 4: Database transaction
     async with acquire_with_retry(pool) as conn:
         async with conn.transaction():
-            # Ensure bank exists
-            await fact_storage.ensure_bank_exists(conn, bank_id)
-
             # Handle document tracking for all documents
             step_start = time.time()
             # Map None document_id to generated UUIDs
@@ -413,20 +435,7 @@ async def retain_batch(
                         actual_doc_id = document_id
                     processed_fact.document_id = actual_doc_id
 
-            # Deduplication
-            step_start = time.time()
-            is_duplicate_flags = await deduplication.check_duplicates_batch(
-                conn, bank_id, processed_facts, duplicate_checker_fn
-            )
-            log_buffer.append(
-                f"[4] Deduplication: {sum(is_duplicate_flags)} duplicates in {time.time() - step_start:.3f}s"
-            )
-
-            # Filter out duplicates
-            non_duplicate_facts = deduplication.filter_duplicates(processed_facts, is_duplicate_flags)
-
-            if not non_duplicate_facts:
-                return [[] for _ in contents], usage
+            non_duplicate_facts = processed_facts
 
             # Insert facts (document_id is now stored per-fact)
             step_start = time.time()
@@ -447,6 +456,7 @@ async def retain_batch(
                 non_duplicate_facts,
                 log_buffer,
                 user_entities_per_content=user_entities_per_content,
+                entity_labels=getattr(config, "entity_labels", None),
             )
             log_buffer.append(f"[6] Process entities: {len(entity_links)} links in {time.time() - step_start:.3f}s")
 
@@ -477,7 +487,16 @@ async def retain_batch(
             log_buffer.append(f"[10] Causal links: {causal_link_count} links in {time.time() - step_start:.3f}s")
 
             # Map results back to original content items
-            result_unit_ids = _map_results_to_contents(contents, extracted_facts, is_duplicate_flags, unit_ids)
+            result_unit_ids = _map_results_to_contents(contents, extracted_facts, unit_ids)
+
+            # Transactional outbox: queue any side-effect tasks (e.g. webhook deliveries)
+            # inside the same transaction so they are atomically committed with the retain data.
+            if outbox_callback:
+                await outbox_callback(conn)
+
+        # Flush entity stats (mention_count / last_seen) now that the transaction
+        # has committed.  Uses a fresh pool connection — no locks held.
+        await entity_resolver.flush_pending_stats()
 
         # Log final summary
         total_time = time.time() - start_time
@@ -495,28 +514,20 @@ async def retain_batch(
 def _map_results_to_contents(
     contents: list[RetainContent],
     extracted_facts: list[ExtractedFact],
-    is_duplicate_flags: list[bool],
     unit_ids: list[str],
 ) -> list[list[str]]:
-    """
-    Map created unit IDs back to original content items.
-
-    Accounts for duplicates when mapping back.
-    """
-    result_unit_ids = []
-    filtered_idx = 0
-
-    # Group facts by content_index
-    facts_by_content = {i: [] for i in range(len(contents))}
+    """Map created unit IDs back to original content items."""
+    facts_by_content: dict[int, list[int]] = {i: [] for i in range(len(contents))}
     for i, fact in enumerate(extracted_facts):
         facts_by_content[fact.content_index].append(i)
 
+    result_unit_ids = []
+    unit_idx = 0
     for content_index in range(len(contents)):
         content_unit_ids = []
-        for fact_idx in facts_by_content[content_index]:
-            if not is_duplicate_flags[fact_idx]:
-                content_unit_ids.append(unit_ids[filtered_idx])
-                filtered_idx += 1
+        for _ in facts_by_content[content_index]:
+            content_unit_ids.append(unit_ids[unit_idx])
+            unit_idx += 1
         result_unit_ids.append(content_unit_ids)
 
     return result_unit_ids

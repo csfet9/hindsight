@@ -1,11 +1,11 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, type ReactNode } from "react";
 import { useBank } from "@/lib/bank-context";
+import { useFeatures } from "@/lib/features-context";
 import { client } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Select,
@@ -14,161 +14,393 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { Loader2, AlertCircle, CheckCircle2, Pencil, RotateCcw, MoreVertical } from "lucide-react";
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Switch } from "@/components/ui/switch";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
+import { Loader2, AlertCircle, Plus, Trash2, ChevronDown, ChevronRight } from "lucide-react";
+import { Card } from "@/components/ui/card";
 
-// Field metadata for UI rendering
-const FIELD_CATEGORIES = {
-  retention: {
-    title: "Retention Settings",
-    description: "Control how memories are extracted and stored",
-    fields: {
-      retain_chunk_size: {
-        label: "Chunk Size",
-        type: "number",
-        description: "Size of text chunks for processing (tokens)",
-        min: 500,
-        max: 8000,
-      },
-      retain_extraction_mode: {
-        label: "Extraction Mode",
-        type: "select",
-        description: "How to extract facts from content",
-        options: ["concise", "verbose", "custom"],
-      },
-      retain_custom_instructions: {
-        label: "Custom Instructions",
-        type: "textarea",
-        description:
-          "Custom instructions for fact extraction (requires retain_extraction_mode='custom')",
-        placeholder: "Focus on technical details and implementation specifics...",
-        rows: 3,
-      },
-    },
-  },
-  consolidation: {
-    title: "Consolidation Settings",
-    description: "Control observation synthesis",
-    fields: {
-      enable_observations: {
-        label: "Enable Observations",
-        type: "boolean",
-        description: "Enable automatic consolidation of facts into observations",
-      },
-    },
-  },
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface ProfileData {
+  reflect_mission: string;
+  disposition_skepticism: number;
+  disposition_literalism: number;
+  disposition_empathy: number;
+}
+
+type RetainEdits = {
+  retain_chunk_size: number | null;
+  retain_extraction_mode: string | null;
+  retain_mission: string | null;
+  retain_custom_instructions: string | null;
 };
+
+type ObservationsEdits = {
+  enable_observations: boolean | null;
+  consolidation_llm_batch_size: number | null;
+  consolidation_source_facts_max_tokens: number | null;
+  consolidation_source_facts_max_tokens_per_observation: number | null;
+  observations_mission: string | null;
+};
+
+type LabelValue = { value: string; description: string };
+type LabelGroup = {
+  key: string;
+  description: string;
+  type: "value" | "multi-values" | "text";
+  optional: boolean;
+  tag: boolean;
+  values: LabelValue[];
+};
+
+type EntityLabelsEdits = {
+  entity_labels: LabelGroup[] | null;
+  entities_allow_free_form: boolean;
+};
+
+type MCPEdits = {
+  mcp_enabled_tools: string[] | null;
+};
+
+type GeminiSafetySetting = {
+  category: string;
+  threshold: string;
+};
+
+type GeminiEdits = {
+  llm_gemini_safety_settings: GeminiSafetySetting[] | null;
+};
+
+// ─── Gemini safety settings catalogue ────────────────────────────────────────
+
+const GEMINI_HARM_CATEGORIES = [
+  { value: "HARM_CATEGORY_HARASSMENT", label: "Harassment" },
+  { value: "HARM_CATEGORY_HATE_SPEECH", label: "Hate Speech" },
+  { value: "HARM_CATEGORY_SEXUALLY_EXPLICIT", label: "Sexually Explicit" },
+  { value: "HARM_CATEGORY_DANGEROUS_CONTENT", label: "Dangerous Content" },
+] as const;
+
+const GEMINI_THRESHOLDS = [
+  { value: "HARM_BLOCK_THRESHOLD_UNSPECIFIED", label: "Unspecified (use Gemini default)" },
+  { value: "OFF", label: "Off (filter disabled)" },
+  { value: "BLOCK_NONE", label: "Block none" },
+  { value: "BLOCK_LOW_AND_ABOVE", label: "Block low & above" },
+  { value: "BLOCK_MEDIUM_AND_ABOVE", label: "Block medium & above" },
+  { value: "BLOCK_ONLY_HIGH", label: "Block only high" },
+] as const;
+
+const DEFAULT_GEMINI_SAFETY_SETTINGS: GeminiSafetySetting[] = GEMINI_HARM_CATEGORIES.map((c) => ({
+  category: c.value,
+  threshold: "BLOCK_NONE",
+}));
+
+// ─── MCP tool catalogue ───────────────────────────────────────────────────────
+
+const MCP_TOOL_GROUPS: { label: string; tools: string[] }[] = [
+  { label: "Core", tools: ["retain", "recall", "reflect"] },
+  {
+    label: "Bank management",
+    tools: [
+      "list_banks",
+      "create_bank",
+      "get_bank",
+      "get_bank_stats",
+      "update_bank",
+      "delete_bank",
+      "clear_memories",
+    ],
+  },
+  {
+    label: "Mental models",
+    tools: [
+      "list_mental_models",
+      "get_mental_model",
+      "create_mental_model",
+      "update_mental_model",
+      "delete_mental_model",
+      "refresh_mental_model",
+    ],
+  },
+  { label: "Directives", tools: ["list_directives", "create_directive", "delete_directive"] },
+  { label: "Memories", tools: ["list_memories", "get_memory", "delete_memory"] },
+  { label: "Documents", tools: ["list_documents", "get_document", "delete_document"] },
+  { label: "Operations", tools: ["list_operations", "get_operation", "cancel_operation"] },
+  { label: "Tags", tools: ["list_tags"] },
+];
+
+const ALL_TOOLS: string[] = MCP_TOOL_GROUPS.flatMap((g) => g.tools);
+
+// ─── Slice helpers ────────────────────────────────────────────────────────────
+
+function retainSlice(config: Record<string, any>): RetainEdits {
+  return {
+    retain_chunk_size: config.retain_chunk_size ?? null,
+    retain_extraction_mode: config.retain_extraction_mode ?? null,
+    retain_mission: config.retain_mission ?? null,
+    retain_custom_instructions: config.retain_custom_instructions ?? null,
+  };
+}
+
+function observationsSlice(config: Record<string, any>): ObservationsEdits {
+  return {
+    enable_observations: config.enable_observations ?? null,
+    consolidation_llm_batch_size: config.consolidation_llm_batch_size ?? null,
+    consolidation_source_facts_max_tokens: config.consolidation_source_facts_max_tokens ?? null,
+    consolidation_source_facts_max_tokens_per_observation:
+      config.consolidation_source_facts_max_tokens_per_observation ?? null,
+    observations_mission: config.observations_mission ?? null,
+  };
+}
+
+function entityLabelsSlice(config: Record<string, any>): EntityLabelsEdits {
+  const raw = config.entity_labels;
+  let attrs: LabelGroup[] | null = null;
+  if (Array.isArray(raw)) {
+    attrs = raw as LabelGroup[];
+  } else if (raw && typeof raw === "object" && Array.isArray(raw.attributes)) {
+    attrs = raw.attributes as LabelGroup[];
+  }
+  return {
+    entity_labels: attrs,
+    entities_allow_free_form: config.entities_allow_free_form ?? true,
+  };
+}
+
+function mcpSlice(config: Record<string, any>): MCPEdits {
+  return {
+    mcp_enabled_tools: config.mcp_enabled_tools ?? null,
+  };
+}
+
+function geminiSlice(config: Record<string, any>): GeminiEdits {
+  return {
+    llm_gemini_safety_settings: config.llm_gemini_safety_settings ?? null,
+  };
+}
+
+const DEFAULT_PROFILE: ProfileData = {
+  reflect_mission: "",
+  disposition_skepticism: 3,
+  disposition_literalism: 3,
+  disposition_empathy: 3,
+};
+
+// ─── BankConfigView ───────────────────────────────────────────────────────────
 
 export function BankConfigView() {
   const { currentBank: bankId } = useBank();
+  const { features } = useFeatures();
+  const bankConfigEnabled = features?.bank_config_api ?? true; // optimistic default while loading
   const [loading, setLoading] = useState(true);
-  const [config, setConfig] = useState<Record<string, any>>({});
-  const [overrides, setOverrides] = useState<Record<string, any>>({});
-  const [showEditDialog, setShowEditDialog] = useState(false);
-  const [showResetDialog, setShowResetDialog] = useState(false);
-  const [resetting, setResetting] = useState(false);
+
+  // Source of truth
+  const [baseConfig, setBaseConfig] = useState<Record<string, any>>({});
+  const [baseProfile, setBaseProfile] = useState<ProfileData>(DEFAULT_PROFILE);
+
+  // Per-section local edits
+  const [retainEdits, setRetainEdits] = useState<RetainEdits>(retainSlice({}));
+  const [observationsEdits, setObservationsEdits] = useState<ObservationsEdits>(
+    observationsSlice({})
+  );
+  const [entityLabelsEdits, setEntityLabelsEdits] = useState<EntityLabelsEdits>(
+    entityLabelsSlice({})
+  );
+  const [reflectEdits, setReflectEdits] = useState<ProfileData>(DEFAULT_PROFILE);
+  const [mcpEdits, setMcpEdits] = useState<MCPEdits>(mcpSlice({}));
+  const [geminiEdits, setGeminiEdits] = useState<GeminiEdits>(geminiSlice({}));
+
+  // Per-section saving/error state
+  const [retainSaving, setRetainSaving] = useState(false);
+  const [observationsSaving, setObservationsSaving] = useState(false);
+  const [entityLabelsSaving, setEntityLabelsSaving] = useState(false);
+  const [reflectSaving, setReflectSaving] = useState(false);
+  const [mcpSaving, setMcpSaving] = useState(false);
+  const [geminiSaving, setGeminiSaving] = useState(false);
+  const [retainError, setRetainError] = useState<string | null>(null);
+  const [observationsError, setObservationsError] = useState<string | null>(null);
+  const [entityLabelsError, setEntityLabelsError] = useState<string | null>(null);
+  const [reflectError, setReflectError] = useState<string | null>(null);
+  const [mcpError, setMcpError] = useState<string | null>(null);
+  const [geminiError, setGeminiError] = useState<string | null>(null);
+
+  // Reset dialog
+
+  // Dirty tracking
+  const retainDirty = useMemo(
+    () => JSON.stringify(retainEdits) !== JSON.stringify(retainSlice(baseConfig)),
+    [retainEdits, baseConfig]
+  );
+  const observationsDirty = useMemo(
+    () => JSON.stringify(observationsEdits) !== JSON.stringify(observationsSlice(baseConfig)),
+    [observationsEdits, baseConfig]
+  );
+  const entityLabelsDirty = useMemo(
+    () => JSON.stringify(entityLabelsEdits) !== JSON.stringify(entityLabelsSlice(baseConfig)),
+    [entityLabelsEdits, baseConfig]
+  );
+  const reflectDirty = useMemo(
+    () => JSON.stringify(reflectEdits) !== JSON.stringify(baseProfile),
+    [reflectEdits, baseProfile]
+  );
+  const mcpDirty = useMemo(
+    () => JSON.stringify(mcpEdits) !== JSON.stringify(mcpSlice(baseConfig)),
+    [mcpEdits, baseConfig]
+  );
+  const geminiDirty = useMemo(
+    () => JSON.stringify(geminiEdits) !== JSON.stringify(geminiSlice(baseConfig)),
+    [geminiEdits, baseConfig]
+  );
 
   useEffect(() => {
-    if (bankId) {
-      loadConfig();
-    }
+    if (bankId) loadAll();
   }, [bankId]);
 
-  const loadConfig = async () => {
+  const loadAll = async () => {
     if (!bankId) return;
-
     setLoading(true);
     try {
-      const response = await client.getBankConfig(bankId);
-      setConfig(response.config);
-      setOverrides(response.overrides);
-    } catch (err: any) {
-      console.error("Failed to load config:", err);
+      const [configResp, profileResp] = await Promise.all([
+        client.getBankConfig(bankId),
+        client.getBankProfile(bankId),
+      ]);
+      const cfg = configResp.config;
+      const prof: ProfileData = {
+        reflect_mission: profileResp.mission ?? "",
+        disposition_skepticism:
+          cfg.disposition_skepticism ?? profileResp.disposition?.skepticism ?? 3,
+        disposition_literalism:
+          cfg.disposition_literalism ?? profileResp.disposition?.literalism ?? 3,
+        disposition_empathy: cfg.disposition_empathy ?? profileResp.disposition?.empathy ?? 3,
+      };
+      setBaseConfig(cfg);
+      setBaseProfile(prof);
+      setRetainEdits(retainSlice(cfg));
+      setObservationsEdits(observationsSlice(cfg));
+      setEntityLabelsEdits(entityLabelsSlice(cfg));
+      setReflectEdits(prof);
+      setMcpEdits(mcpSlice(cfg));
+      setGeminiEdits(geminiSlice(cfg));
+    } catch (err) {
+      console.error("Failed to load bank data:", err);
     } finally {
       setLoading(false);
     }
   };
 
-  const handleReset = () => {
-    setShowResetDialog(true);
-  };
-
-  const confirmReset = async () => {
+  const saveRetain = async () => {
     if (!bankId) return;
-
-    setResetting(true);
+    setRetainSaving(true);
+    setRetainError(null);
     try {
-      await client.resetBankConfig(bankId);
-      await loadConfig();
-      setShowResetDialog(false);
+      await client.updateBankConfig(bankId, retainEdits);
+      setBaseConfig((prev) => ({ ...prev, ...retainEdits }));
     } catch (err: any) {
-      console.error("Failed to reset config:", err);
-      alert("Error resetting config: " + err.message);
+      setRetainError(err.message || "Failed to save retain settings");
     } finally {
-      setResetting(false);
+      setRetainSaving(false);
     }
   };
 
-  const renderReadOnlyField = (fieldKey: string, fieldMeta: any) => {
-    const value = config[fieldKey];
+  const saveObservations = async () => {
+    if (!bankId) return;
+    setObservationsSaving(true);
+    setObservationsError(null);
+    try {
+      await client.updateBankConfig(bankId, observationsEdits);
+      setBaseConfig((prev) => ({ ...prev, ...observationsEdits }));
+    } catch (err: any) {
+      setObservationsError(err.message || "Failed to save observations settings");
+    } finally {
+      setObservationsSaving(false);
+    }
+  };
 
-    return (
-      <div
-        key={fieldKey}
-        className="flex items-start justify-between gap-4 p-3 border border-border rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors"
-      >
-        <div className="flex-1 min-w-0">
-          <div className="text-sm font-medium font-mono">{fieldKey}</div>
-          {fieldMeta.description && (
-            <p className="text-xs text-muted-foreground mt-0.5">{fieldMeta.description}</p>
-          )}
-        </div>
-        <div className="text-sm text-foreground font-mono flex-shrink-0">
-          {fieldMeta.type === "boolean" ? (
-            <span className={value ? "text-green-600" : "text-muted-foreground"}>
-              {value ? "Enabled" : "Disabled"}
-            </span>
-          ) : fieldMeta.type === "textarea" ? (
-            <span className="text-muted-foreground italic">
-              {value ? `${value.substring(0, 50)}${value.length > 50 ? "..." : ""}` : "Not set"}
-            </span>
-          ) : (
-            value || <span className="text-muted-foreground italic">Not set</span>
-          )}
-        </div>
-      </div>
-    );
+  const saveEntityLabels = async () => {
+    if (!bankId) return;
+    setEntityLabelsSaving(true);
+    setEntityLabelsError(null);
+    try {
+      const payload = {
+        entity_labels: entityLabelsEdits.entity_labels,
+        entities_allow_free_form: entityLabelsEdits.entities_allow_free_form,
+      };
+      await client.updateBankConfig(bankId, payload);
+      setBaseConfig((prev) => ({ ...prev, ...payload }));
+    } catch (err: any) {
+      setEntityLabelsError(err.message || "Failed to save entity labels settings");
+    } finally {
+      setEntityLabelsSaving(false);
+    }
+  };
+
+  const saveReflect = async () => {
+    if (!bankId) return;
+    setReflectSaving(true);
+    setReflectError(null);
+    try {
+      await client.updateBankConfig(bankId, {
+        reflect_mission: reflectEdits.reflect_mission || null,
+        disposition_skepticism: reflectEdits.disposition_skepticism,
+        disposition_literalism: reflectEdits.disposition_literalism,
+        disposition_empathy: reflectEdits.disposition_empathy,
+      });
+      setBaseProfile(reflectEdits);
+    } catch (err: any) {
+      setReflectError(err.message || "Failed to save reflect settings");
+    } finally {
+      setReflectSaving(false);
+    }
+  };
+
+  const saveMCP = async () => {
+    if (!bankId) return;
+    setMcpSaving(true);
+    setMcpError(null);
+    try {
+      await client.updateBankConfig(bankId, mcpEdits);
+      setBaseConfig((prev) => ({ ...prev, ...mcpEdits }));
+    } catch (err: any) {
+      setMcpError(err.message || "Failed to save MCP settings");
+    } finally {
+      setMcpSaving(false);
+    }
+  };
+
+  const saveGemini = async () => {
+    if (!bankId) return;
+    setGeminiSaving(true);
+    setGeminiError(null);
+    try {
+      await client.updateBankConfig(bankId, geminiEdits);
+      setBaseConfig((prev) => ({ ...prev, ...geminiEdits }));
+    } catch (err: any) {
+      setGeminiError(err.message || "Failed to save Gemini settings");
+    } finally {
+      setGeminiSaving(false);
+    }
   };
 
   if (!bankId) {
     return (
       <div className="flex items-center justify-center py-12">
         <p className="text-muted-foreground">No bank selected</p>
+      </div>
+    );
+  }
+
+  if (!bankConfigEnabled) {
+    return (
+      <div className="flex flex-col items-center justify-center py-16 gap-3 text-center">
+        <p className="text-base font-medium text-foreground">Bank configuration is disabled</p>
+        <p className="text-sm text-muted-foreground max-w-sm">
+          Set{" "}
+          <code className="font-mono text-xs bg-muted px-1 py-0.5 rounded">
+            HINDSIGHT_API_ENABLE_BANK_CONFIG_API=true
+          </code>{" "}
+          to enable per-bank configuration.
+        </p>
       </div>
     );
   }
@@ -183,298 +415,877 @@ export function BankConfigView() {
 
   return (
     <>
-      <Card>
-        <CardHeader className="pb-3">
-          <div className="flex items-center justify-between">
-            <div>
-              <CardTitle className="text-base">Configuration Settings</CardTitle>
-              <CardDescription className="text-xs">
-                Behavioral parameters for this memory bank
-              </CardDescription>
-            </div>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="sm" disabled={resetting}>
-                  {resetting ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <MoreVertical className="h-4 w-4" />
-                  )}
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={() => setShowEditDialog(true)}>
-                  <Pencil className="h-4 w-4 mr-2" />
-                  Edit
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={handleReset}>
-                  <RotateCcw className="h-4 w-4 mr-2" />
-                  Reset to Defaults
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          {Object.entries(FIELD_CATEGORIES).map(([catKey, category]) => (
-            <div key={catKey}>
-              <div className="mb-3">
-                <h3 className="text-sm font-semibold">{category.title}</h3>
-                <p className="text-xs text-muted-foreground">{category.description}</p>
-              </div>
-              <div className="grid grid-cols-2 gap-x-8 gap-y-4">
-                {Object.entries(category.fields).map(([fieldKey, fieldMeta]) =>
-                  renderReadOnlyField(fieldKey, fieldMeta)
-                )}
-              </div>
-            </div>
-          ))}
-        </CardContent>
-      </Card>
+      <div className="space-y-8">
+        {/* Retain Section */}
+        <ConfigSection
+          title="Retain"
+          description="Control what gets extracted and stored from content"
+          error={retainError}
+          dirty={retainDirty}
+          saving={retainSaving}
+          onSave={saveRetain}
+        >
+          <FieldRow
+            label="Chunk Size"
+            description="Size of text chunks for processing (characters)"
+          >
+            <Input
+              type="number"
+              min={500}
+              max={8000}
+              value={retainEdits.retain_chunk_size ?? ""}
+              onChange={(e) =>
+                setRetainEdits((prev) => ({
+                  ...prev,
+                  retain_chunk_size: e.target.value ? parseFloat(e.target.value) : null,
+                }))
+              }
+            />
+          </FieldRow>
+          <TextareaRow
+            label="Mission"
+            description="What this bank should pay attention to during extraction. Steers the LLM without replacing the extraction rules — works alongside any extraction mode."
+            value={retainEdits.retain_mission ?? ""}
+            onChange={(v) => setRetainEdits((prev) => ({ ...prev, retain_mission: v || null }))}
+            placeholder="e.g. Always include technical decisions, API design choices, and architectural trade-offs. Ignore meeting logistics, greetings, and social exchanges."
+            rows={3}
+          />
+          <FieldRow
+            label="Extraction Mode"
+            description="How aggressively to extract facts: concise (default, selective), verbose (capture everything), custom (write your own extraction rules)"
+          >
+            <Select
+              value={retainEdits.retain_extraction_mode ?? ""}
+              onValueChange={(val) =>
+                setRetainEdits((prev) => ({ ...prev, retain_extraction_mode: val }))
+              }
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {["concise", "verbose", "custom"].map((opt) => (
+                  <SelectItem key={opt} value={opt}>
+                    {opt}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </FieldRow>
+          {retainEdits.retain_extraction_mode === "custom" && (
+            <TextareaRow
+              label="Custom Extraction Prompt"
+              description="Replaces the built-in extraction rules entirely. Only active when Extraction Mode is set to custom."
+              value={retainEdits.retain_custom_instructions ?? ""}
+              onChange={(v) =>
+                setRetainEdits((prev) => ({ ...prev, retain_custom_instructions: v || null }))
+              }
+              rows={5}
+            />
+          )}
+        </ConfigSection>
 
-      {showEditDialog && (
-        <ConfigEditDialog
-          bankId={bankId}
-          initialConfig={config}
-          overrides={overrides}
-          onClose={() => setShowEditDialog(false)}
-          onSaved={() => {
-            loadConfig();
-            setShowEditDialog(false);
-          }}
-        />
-      )}
+        {/* Entity Labels Section */}
+        <ConfigSection
+          title="Entities"
+          description="Control entity extraction and define a controlled vocabulary of key:value classification labels (e.g. pedagogy:scaffolding, interest:active)"
+          error={entityLabelsError}
+          dirty={entityLabelsDirty}
+          saving={entityLabelsSaving}
+          onSave={saveEntityLabels}
+        >
+          <FieldRow
+            label="Free Form Entities"
+            description="Extract regular named entities (people, places, concepts) alongside entity labels. Disable to restrict extraction to entity labels only."
+          >
+            <div className="flex justify-end items-center gap-2">
+              <Label
+                htmlFor="entities-allow-free-form"
+                className="text-sm text-muted-foreground cursor-pointer select-none"
+              >
+                {entityLabelsEdits.entities_allow_free_form ? "Enabled" : "Disabled"}
+              </Label>
+              <Switch
+                id="entities-allow-free-form"
+                checked={entityLabelsEdits.entities_allow_free_form}
+                onCheckedChange={(v) =>
+                  setEntityLabelsEdits((prev) => ({ ...prev, entities_allow_free_form: v }))
+                }
+              />
+            </div>
+          </FieldRow>
+          <EntityLabelsEditor
+            value={entityLabelsEdits.entity_labels ?? []}
+            onChange={(attrs) =>
+              setEntityLabelsEdits((prev) => ({
+                ...prev,
+                entity_labels: attrs.length > 0 ? attrs : null,
+              }))
+            }
+          />
+        </ConfigSection>
 
-      <AlertDialog open={showResetDialog} onOpenChange={setShowResetDialog}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Reset Configuration</AlertDialogTitle>
-            <AlertDialogDescription>
-              Are you sure you want to reset all configuration overrides to defaults? This action
-              cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={resetting}>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={confirmReset} disabled={resetting}>
-              {resetting ? (
-                <>
-                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                  Resetting...
-                </>
-              ) : (
-                "Reset to Defaults"
+        {/* Observations Section */}
+        <ConfigSection
+          title="Observations"
+          description="Control how facts are synthesized into durable observations"
+          error={observationsError}
+          dirty={observationsDirty}
+          saving={observationsSaving}
+          onSave={saveObservations}
+        >
+          <FieldRow
+            label="Enable Observations"
+            description="Enable automatic consolidation of facts into observations"
+          >
+            <div className="flex justify-end">
+              <Switch
+                checked={observationsEdits.enable_observations ?? false}
+                onCheckedChange={(v) =>
+                  setObservationsEdits((prev) => ({ ...prev, enable_observations: v }))
+                }
+              />
+            </div>
+          </FieldRow>
+          <TextareaRow
+            label="Mission"
+            description="What this bank should synthesise into durable observations. Replaces the built-in consolidation rules — leave blank to use the server default."
+            value={observationsEdits.observations_mission ?? ""}
+            onChange={(v) =>
+              setObservationsEdits((prev) => ({ ...prev, observations_mission: v || null }))
+            }
+            placeholder="e.g. Observations are stable facts about people and projects. Always include preferences, skills, and recurring patterns. Ignore one-off events and ephemeral state."
+            rows={3}
+          />
+          <FieldRow
+            label="LLM Batch Size"
+            description="Number of facts sent to the LLM in a single consolidation call. Higher values reduce LLM calls at the cost of larger prompts. Leave blank to use the server default."
+          >
+            <Input
+              type="number"
+              min={1}
+              max={64}
+              value={observationsEdits.consolidation_llm_batch_size ?? ""}
+              onChange={(e) =>
+                setObservationsEdits((prev) => ({
+                  ...prev,
+                  consolidation_llm_batch_size: e.target.value
+                    ? parseInt(e.target.value, 10)
+                    : null,
+                }))
+              }
+              placeholder="Server default"
+            />
+          </FieldRow>
+          <FieldRow
+            label="Source Facts Max Tokens"
+            description="Total token budget for source facts included with observations during consolidation. -1 = unlimited."
+          >
+            <Input
+              type="number"
+              min={-1}
+              value={observationsEdits.consolidation_source_facts_max_tokens ?? ""}
+              onChange={(e) =>
+                setObservationsEdits((prev) => ({
+                  ...prev,
+                  consolidation_source_facts_max_tokens: e.target.value
+                    ? parseInt(e.target.value, 10)
+                    : null,
+                }))
+              }
+              placeholder="Server default"
+            />
+          </FieldRow>
+          <FieldRow
+            label="Source Facts Max Tokens Per Observation"
+            description="Per-observation token cap for source facts during consolidation. Each observation gets at most this many tokens of source facts. -1 = unlimited."
+          >
+            <Input
+              type="number"
+              min={-1}
+              value={observationsEdits.consolidation_source_facts_max_tokens_per_observation ?? ""}
+              onChange={(e) =>
+                setObservationsEdits((prev) => ({
+                  ...prev,
+                  consolidation_source_facts_max_tokens_per_observation: e.target.value
+                    ? parseInt(e.target.value, 10)
+                    : null,
+                }))
+              }
+              placeholder="Server default"
+            />
+          </FieldRow>
+        </ConfigSection>
+
+        {/* Reflect Section */}
+        <ConfigSection
+          title="Reflect"
+          description="Shape how the bank reasons and responds in reflect operations"
+          error={reflectError}
+          dirty={reflectDirty}
+          saving={reflectSaving}
+          onSave={saveReflect}
+        >
+          <TextareaRow
+            label="Mission"
+            description="Agent identity and purpose. Used as framing context in reflect."
+            value={reflectEdits.reflect_mission}
+            onChange={(v) => setReflectEdits((prev) => ({ ...prev, reflect_mission: v }))}
+            placeholder="e.g. You are a senior engineering assistant. Always ground answers in documented decisions and rationale. Ignore speculation. Be direct and precise."
+            rows={3}
+          />
+          <TraitRow
+            label="Skepticism"
+            description="How skeptical vs trusting when evaluating claims"
+            lowLabel="Trusting"
+            highLabel="Skeptical"
+            value={reflectEdits.disposition_skepticism}
+            onChange={(v) => setReflectEdits((prev) => ({ ...prev, disposition_skepticism: v }))}
+          />
+          <TraitRow
+            label="Literalism"
+            description="How literally to interpret information"
+            lowLabel="Flexible"
+            highLabel="Literal"
+            value={reflectEdits.disposition_literalism}
+            onChange={(v) => setReflectEdits((prev) => ({ ...prev, disposition_literalism: v }))}
+          />
+          <TraitRow
+            label="Empathy"
+            description="How much to weight emotional context"
+            lowLabel="Detached"
+            highLabel="Empathetic"
+            value={reflectEdits.disposition_empathy}
+            onChange={(v) => setReflectEdits((prev) => ({ ...prev, disposition_empathy: v }))}
+          />
+        </ConfigSection>
+
+        {/* MCP Tools Section */}
+        <ConfigSection
+          title="MCP Tools"
+          description="Restrict which MCP tools this bank exposes to agents"
+          error={mcpError}
+          dirty={mcpDirty}
+          saving={mcpSaving}
+          onSave={saveMCP}
+        >
+          <FieldRow
+            label="Restrict tools"
+            description="When off, all tools are available. When on, only the selected tools can be invoked for this bank."
+          >
+            <div className="flex items-center gap-2 justify-end">
+              <Switch
+                checked={mcpEdits.mcp_enabled_tools !== null}
+                onCheckedChange={(restricted) =>
+                  setMcpEdits({
+                    mcp_enabled_tools: restricted ? [...ALL_TOOLS] : null,
+                  })
+                }
+              />
+              <Label className="text-xs text-muted-foreground">
+                {mcpEdits.mcp_enabled_tools !== null ? "Enabled" : "Disabled"}
+              </Label>
+            </div>
+          </FieldRow>
+          {mcpEdits.mcp_enabled_tools !== null && (
+            <ToolSelector
+              selected={mcpEdits.mcp_enabled_tools}
+              onChange={(tools) => setMcpEdits({ mcp_enabled_tools: tools })}
+            />
+          )}
+        </ConfigSection>
+
+        {/* Models Section */}
+        <ConfigSection
+          title="Models"
+          description="Provider-specific model settings"
+          error={geminiError}
+          dirty={geminiDirty}
+          saving={geminiSaving}
+          onSave={saveGemini}
+        >
+          {/* Gemini subsection */}
+          <div className="px-6 py-4 space-y-4">
+            <p className="text-sm font-semibold">Gemini / Vertex AI</p>
+            <div className="pl-4 border-l-2 border-border/40 space-y-4">
+              <FieldRow
+                label="Safety settings"
+                description={
+                  <>
+                    When off, Gemini&apos;s default safety thresholds are used. When on, configure
+                    thresholds per harm category.{" "}
+                    <a
+                      href="https://ai.google.dev/gemini-api/docs/safety-settings"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="underline hover:text-foreground transition-colors"
+                    >
+                      Learn more
+                    </a>
+                  </>
+                }
+              >
+                <div className="flex items-center gap-2 justify-end">
+                  <Switch
+                    checked={geminiEdits.llm_gemini_safety_settings !== null}
+                    onCheckedChange={(enabled) =>
+                      setGeminiEdits({
+                        llm_gemini_safety_settings: enabled
+                          ? [...DEFAULT_GEMINI_SAFETY_SETTINGS]
+                          : null,
+                      })
+                    }
+                  />
+                  <Label className="text-xs text-muted-foreground">
+                    {geminiEdits.llm_gemini_safety_settings !== null ? "Custom" : "Default"}
+                  </Label>
+                </div>
+              </FieldRow>
+              {geminiEdits.llm_gemini_safety_settings !== null && (
+                <GeminiSafetyEditor
+                  value={geminiEdits.llm_gemini_safety_settings}
+                  onChange={(settings) => setGeminiEdits({ llm_gemini_safety_settings: settings })}
+                />
               )}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+            </div>
+          </div>
+        </ConfigSection>
+      </div>
     </>
   );
 }
 
-// Edit dialog component
-function ConfigEditDialog({
-  bankId,
-  initialConfig,
-  overrides,
-  onClose,
-  onSaved,
+// ─── ToolSelector ─────────────────────────────────────────────────────────────
+
+function ToolSelector({
+  selected,
+  onChange,
 }: {
-  bankId: string;
-  initialConfig: Record<string, any>;
-  overrides: Record<string, any>;
-  onClose: () => void;
-  onSaved: () => void;
+  selected: string[];
+  onChange: (tools: string[]) => void;
 }) {
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [config, setConfig] = useState(initialConfig);
+  const selectedSet = new Set(selected);
 
-  const handleFieldChange = (field: string, value: any) => {
-    setConfig({ ...config, [field]: value });
+  const toggleTool = (tool: string) => {
+    const next = new Set(selectedSet);
+    if (next.has(tool)) {
+      next.delete(tool);
+    } else {
+      next.add(tool);
+    }
+    onChange(ALL_TOOLS.filter((t) => next.has(t)));
   };
 
-  const handleSave = async () => {
-    setSaving(true);
-    setError(null);
-    try {
-      const updates: Record<string, any> = {};
-      Object.keys(config).forEach((key) => {
-        const isConfigurable = Object.values(FIELD_CATEGORIES).some((cat) =>
-          Object.keys(cat.fields).includes(key)
-        );
-        if (isConfigurable) {
-          updates[key] = config[key];
-        }
-      });
+  const allSelected = ALL_TOOLS.every((t) => selectedSet.has(t));
+  const noneSelected = selected.length === 0;
 
-      await client.updateBankConfig(bankId, updates);
-      onSaved();
-    } catch (err: any) {
-      console.error("Failed to save config:", err);
-      setError(err.message || "Failed to save configuration");
-      setSaving(false);
-    }
-  };
-
-  const renderField = (fieldKey: string, fieldMeta: any) => {
-    const value = config[fieldKey];
-
-    if (fieldMeta.type === "boolean") {
-      return (
-        <div key={fieldKey} className="space-y-2">
-          <div className="flex items-center justify-between">
-            <div>
-              <Label htmlFor={fieldKey} className="font-mono">
-                {fieldKey}
-              </Label>
-              {fieldMeta.description && (
-                <p className="text-xs text-muted-foreground mt-1">{fieldMeta.description}</p>
-              )}
-            </div>
-            <button
-              onClick={() => handleFieldChange(fieldKey, !value)}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                value ? "bg-primary" : "bg-muted"
-              }`}
-            >
-              <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                  value ? "translate-x-6" : "translate-x-1"
-                }`}
-              />
-            </button>
-          </div>
-        </div>
-      );
-    }
-
-    if (fieldMeta.type === "select") {
-      return (
-        <div key={fieldKey} className="space-y-2">
-          <Label htmlFor={fieldKey} className="font-mono">
-            {fieldKey}
-          </Label>
-          {fieldMeta.description && (
-            <p className="text-xs text-muted-foreground mt-1">{fieldMeta.description}</p>
-          )}
-          <Select
-            value={value?.toString()}
-            onValueChange={(val) => handleFieldChange(fieldKey, val)}
-          >
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {fieldMeta.options.map((opt: string) => (
-                <SelectItem key={opt} value={opt}>
-                  {opt}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-      );
-    }
-
-    if (fieldMeta.type === "textarea") {
-      return (
-        <div key={fieldKey} className="space-y-2">
-          <Label htmlFor={fieldKey} className="font-mono">
-            {fieldKey}
-          </Label>
-          {fieldMeta.description && (
-            <p className="text-xs text-muted-foreground mt-1">{fieldMeta.description}</p>
-          )}
-          <Textarea
-            id={fieldKey}
-            value={value || ""}
-            onChange={(e) => handleFieldChange(fieldKey, e.target.value || null)}
-            placeholder={fieldMeta.placeholder}
-            rows={fieldMeta.rows || 3}
-            className="font-mono text-sm"
-          />
-        </div>
-      );
-    }
-
-    // number or text
-    return (
-      <div key={fieldKey} className="space-y-2">
-        <Label htmlFor={fieldKey} className="font-mono">
-          {fieldKey}
-        </Label>
-        {fieldMeta.description && (
-          <p className="text-xs text-muted-foreground mt-1">{fieldMeta.description}</p>
-        )}
-        <Input
-          id={fieldKey}
-          type={fieldMeta.type || "text"}
-          value={value ?? ""}
-          onChange={(e) =>
-            handleFieldChange(
-              fieldKey,
-              fieldMeta.type === "number" ? parseFloat(e.target.value) : e.target.value
-            )
-          }
-          min={fieldMeta.min}
-          max={fieldMeta.max}
-        />
-      </div>
-    );
+  const toggleAll = () => {
+    onChange(allSelected ? [] : [...ALL_TOOLS]);
   };
 
   return (
-    <Dialog open onOpenChange={onClose}>
-      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle>Edit Configuration</DialogTitle>
-          <DialogDescription>
-            Customize behavioral settings for this bank. Changes only affect this bank and override
-            global defaults.
-          </DialogDescription>
-        </DialogHeader>
+    <div className="px-6 py-4 space-y-4">
+      <div className="flex items-center justify-between">
+        <p className="text-xs text-muted-foreground">
+          {selected.length} of {ALL_TOOLS.length} tools enabled
+        </p>
+        <button type="button" onClick={toggleAll} className="text-xs text-primary hover:underline">
+          {allSelected ? "Deselect all" : "Select all"}
+        </button>
+      </div>
+      <div className="space-y-4">
+        {MCP_TOOL_GROUPS.map((group) => {
+          const groupSelected = group.tools.filter((t) => selectedSet.has(t)).length;
+          const groupAll = groupSelected === group.tools.length;
+          return (
+            <div key={group.label}>
+              <div className="flex items-center justify-between mb-1.5">
+                <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                  {group.label}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = new Set(selectedSet);
+                    if (groupAll) {
+                      group.tools.forEach((t) => next.delete(t));
+                    } else {
+                      group.tools.forEach((t) => next.add(t));
+                    }
+                    onChange(ALL_TOOLS.filter((t) => next.has(t)));
+                  }}
+                  className="text-xs text-primary hover:underline"
+                >
+                  {groupAll ? "Deselect" : "Select all"}
+                </button>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {group.tools.map((tool) => {
+                  const active = selectedSet.has(tool);
+                  return (
+                    <button
+                      key={tool}
+                      type="button"
+                      onClick={() => toggleTool(tool)}
+                      className={`px-2.5 py-1 rounded text-xs font-mono transition-colors border ${
+                        active
+                          ? "bg-primary text-primary-foreground border-primary"
+                          : "bg-muted/30 text-muted-foreground border-border/40 hover:border-primary/40"
+                      }`}
+                    >
+                      {tool}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {noneSelected && (
+        <p className="text-xs text-destructive">
+          Warning: no tools selected — agents will be blocked from all MCP calls for this bank.
+        </p>
+      )}
+    </div>
+  );
+}
 
-        <div className="space-y-6 py-4">
-          {error && (
+// ─── ConfigSection ────────────────────────────────────────────────────────────
+
+function ConfigSection({
+  title,
+  description,
+  children,
+  error,
+  dirty,
+  saving,
+  onSave,
+}: {
+  title: string;
+  description: string;
+  children: ReactNode;
+  error: string | null;
+  dirty: boolean;
+  saving: boolean;
+  onSave: () => void;
+}) {
+  return (
+    <section className="space-y-3">
+      <div>
+        <h2 className="text-lg font-semibold">{title}</h2>
+        <p className="text-sm text-muted-foreground">{description}</p>
+      </div>
+      <Card className="bg-muted/20 border-border/40">
+        <div className="divide-y divide-border/40">{children}</div>
+        {error && (
+          <div className="px-6 pb-2 pt-2">
             <Alert variant="destructive">
               <AlertCircle className="h-4 w-4" />
               <AlertDescription>{error}</AlertDescription>
             </Alert>
-          )}
-
-          {Object.entries(FIELD_CATEGORIES).map(([catKey, category]) => (
-            <div key={catKey} className="space-y-4">
-              <div>
-                <h3 className="text-sm font-semibold">{category.title}</h3>
-                <p className="text-xs text-muted-foreground">{category.description}</p>
-              </div>
-              <div className="grid gap-4">
-                {Object.entries(category.fields).map(([fieldKey, fieldMeta]) =>
-                  renderField(fieldKey, fieldMeta)
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-
-        <DialogFooter>
-          <Button onClick={onClose} variant="outline" disabled={saving}>
-            Cancel
-          </Button>
-          <Button onClick={handleSave} disabled={saving}>
+          </div>
+        )}
+        <div className="px-6 py-4 flex justify-end border-t border-border/40">
+          <Button size="sm" disabled={!dirty || saving} onClick={onSave}>
             {saving ? (
               <>
                 <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                 Saving...
               </>
             ) : (
-              "Save Changes"
+              "Save changes"
             )}
           </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+        </div>
+      </Card>
+    </section>
+  );
+}
+
+// ─── FieldRow (2-column layout for number / select / boolean) ─────────────────
+
+function FieldRow({
+  label,
+  description,
+  children,
+}: {
+  label: string;
+  description?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <div className="px-6 py-4">
+      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+        <div className="flex-1">
+          <p className="text-sm font-medium">{label}</p>
+          {description && <p className="text-xs text-muted-foreground mt-0.5">{description}</p>}
+        </div>
+        <div className="md:w-64 shrink-0">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+// ─── TextareaRow (stacked layout) ─────────────────────────────────────────────
+
+function TextareaRow({
+  label,
+  description,
+  value,
+  onChange,
+  placeholder,
+  rows,
+}: {
+  label: string;
+  description?: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  rows?: number;
+}) {
+  return (
+    <div className="px-6 py-4">
+      <div className="space-y-2">
+        <div>
+          <p className="text-sm font-medium">{label}</p>
+          {description && <p className="text-xs text-muted-foreground mt-0.5">{description}</p>}
+        </div>
+        <Textarea
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+          rows={rows ?? 3}
+          className="font-mono text-sm"
+        />
+      </div>
+    </div>
+  );
+}
+
+// ─── TraitRow (stacked layout with 1–5 selector) ──────────────────────────────
+
+function TraitRow({
+  label,
+  description,
+  lowLabel,
+  highLabel,
+  value,
+  onChange,
+}: {
+  label: string;
+  description?: string;
+  lowLabel?: string;
+  highLabel?: string;
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="px-6 py-4">
+      <div className="space-y-3">
+        <div>
+          <p className="text-sm font-medium">{label}</p>
+          {description && <p className="text-xs text-muted-foreground mt-0.5">{description}</p>}
+        </div>
+        <div className="flex items-center gap-1.5">
+          {lowLabel && (
+            <span className="text-xs text-muted-foreground w-16 text-right shrink-0">
+              {lowLabel}
+            </span>
+          )}
+          <div className="flex gap-0.5">
+            {[1, 2, 3, 4, 5].map((n) => (
+              <button
+                key={n}
+                type="button"
+                onClick={() => onChange(n)}
+                className={`w-4 h-4 rounded-full transition-colors hover:opacity-80 ${
+                  n <= value ? "bg-primary" : "bg-muted"
+                }`}
+              />
+            ))}
+          </div>
+          {highLabel && (
+            <span className="text-xs text-muted-foreground w-20 shrink-0">{highLabel}</span>
+          )}
+          <span className="text-xs font-mono text-muted-foreground ml-1 shrink-0">{value}/5</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── EntityLabelsEditor ───────────────────────────────────────────────────────
+
+function emptyAttribute(): LabelGroup {
+  return {
+    key: "",
+    description: "",
+    type: "value",
+    optional: true,
+    tag: false,
+    values: [],
+  };
+}
+
+function emptyValue(): LabelValue {
+  return { value: "", description: "" };
+}
+
+function EntityLabelsEditor({
+  value,
+  onChange,
+}: {
+  value: LabelGroup[];
+  onChange: (attrs: LabelGroup[]) => void;
+}) {
+  const [expanded, setExpanded] = useState<Record<number, boolean>>({});
+
+  const updateAttr = (i: number, patch: Partial<LabelGroup>) => {
+    const next = value.map((a, idx) => (idx === i ? { ...a, ...patch } : a));
+    onChange(next);
+  };
+
+  const removeAttr = (i: number) => {
+    onChange(value.filter((_, idx) => idx !== i));
+    setExpanded((prev) => {
+      const next = { ...prev };
+      delete next[i];
+      return next;
+    });
+  };
+
+  const addAttr = () => {
+    const next = [...value, emptyAttribute()];
+    onChange(next);
+    setExpanded((prev) => ({ ...prev, [next.length - 1]: true }));
+  };
+
+  const updateVal = (attrIdx: number, valIdx: number, patch: Partial<LabelValue>) => {
+    const newValues = value[attrIdx].values.map((v, vi) =>
+      vi === valIdx ? { ...v, ...patch } : v
+    );
+    updateAttr(attrIdx, { values: newValues });
+  };
+
+  const removeVal = (attrIdx: number, valIdx: number) => {
+    updateAttr(attrIdx, { values: value[attrIdx].values.filter((_, vi) => vi !== valIdx) });
+  };
+
+  const addVal = (attrIdx: number) => {
+    updateAttr(attrIdx, { values: [...value[attrIdx].values, emptyValue()] });
+  };
+
+  return (
+    <div className="px-6 py-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-sm font-medium">Entity Labels</p>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            Classification labels extracted at retain time. Leave empty to disable.
+          </p>
+        </div>
+        {value.length > 0 && (
+          <span className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full shrink-0">
+            {value.length} group{value.length !== 1 ? "s" : ""}
+          </span>
+        )}
+      </div>
+
+      {value.length === 0 && (
+        <p className="text-xs text-muted-foreground italic">No entity labels defined.</p>
+      )}
+
+      <div className="space-y-2">
+        {value.map((attr, i) => {
+          const isOpen = expanded[i] ?? false;
+          const isText = attr.type === "text";
+          const hasValues = !isText;
+          return (
+            <div key={i} className="border border-border/50 rounded-md bg-background">
+              {/* Attribute header */}
+              <div className="flex items-center gap-2 px-3 py-2">
+                <button
+                  type="button"
+                  onClick={() => setExpanded((prev) => ({ ...prev, [i]: !isOpen }))}
+                  className="text-muted-foreground hover:text-foreground shrink-0"
+                  disabled={isText}
+                >
+                  {isOpen && hasValues ? (
+                    <ChevronDown className="h-4 w-4" />
+                  ) : (
+                    <ChevronRight className={`h-4 w-4 ${isText ? "opacity-30" : ""}`} />
+                  )}
+                </button>
+                <Input
+                  placeholder="key (e.g. pedagogy)"
+                  value={attr.key}
+                  onChange={(e) => updateAttr(i, { key: e.target.value })}
+                  className="h-8 text-xs font-mono w-36 shrink-0"
+                />
+                <Input
+                  placeholder={isText ? "description / examples" : "description"}
+                  value={attr.description}
+                  onChange={(e) => updateAttr(i, { description: e.target.value })}
+                  className="h-8 text-xs flex-1 min-w-0"
+                />
+                {/* Type dropdown */}
+                <Select
+                  value={attr.type}
+                  onValueChange={(v: "value" | "multi-values" | "text") =>
+                    updateAttr(i, {
+                      type: v,
+                      // reset values when switching to free text
+                      ...(v === "text" ? { values: [] } : {}),
+                    })
+                  }
+                >
+                  <SelectTrigger className="h-8 text-xs w-32 shrink-0">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="value" className="text-xs">
+                      Single value
+                    </SelectItem>
+                    <SelectItem value="multi-values" className="text-xs">
+                      Multi-values
+                    </SelectItem>
+                    <SelectItem value="text" className="text-xs">
+                      Free text
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                {/* Tag checkbox — also write extracted labels as tags */}
+                <label className="flex items-center gap-1.5 text-xs text-muted-foreground shrink-0 cursor-pointer select-none">
+                  <Checkbox
+                    checked={attr.tag}
+                    onCheckedChange={(checked) => updateAttr(i, { tag: !!checked })}
+                    className="h-4 w-4"
+                  />
+                  tag
+                </label>
+                <button
+                  type="button"
+                  onClick={() => removeAttr(i)}
+                  className="text-muted-foreground hover:text-destructive shrink-0"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </div>
+
+              {/* Values list — enum and multi-values only */}
+              {isOpen && hasValues && (
+                <div className="px-3 pb-3 space-y-1 border-t border-border/30 pt-2">
+                  {attr.values.length === 0 && (
+                    <p className="text-xs text-muted-foreground italic pl-5">No values yet.</p>
+                  )}
+                  {attr.values.map((v, vi) => (
+                    <div key={vi} className="flex items-center gap-2 pl-5">
+                      <Input
+                        placeholder="value"
+                        value={v.value}
+                        onChange={(e) => updateVal(i, vi, { value: e.target.value })}
+                        className="h-8 text-xs font-mono w-32 shrink-0"
+                      />
+                      <Input
+                        placeholder="description"
+                        value={v.description}
+                        onChange={(e) => updateVal(i, vi, { description: e.target.value })}
+                        className="h-8 text-xs flex-1 min-w-0"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => removeVal(i, vi)}
+                        className="text-muted-foreground hover:text-destructive shrink-0"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => addVal(i)}
+                    className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground pl-5 mt-1"
+                  >
+                    <Plus className="h-3 w-3" />
+                    Add value
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <button
+        type="button"
+        onClick={addAttr}
+        className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground"
+      >
+        <Plus className="h-3.5 w-3.5" />
+        Add attribute
+      </button>
+    </div>
+  );
+}
+
+// ─── GeminiSafetyEditor ───────────────────────────────────────────────────────
+
+function GeminiSafetyEditor({
+  value,
+  onChange,
+}: {
+  value: GeminiSafetySetting[];
+  onChange: (settings: GeminiSafetySetting[]) => void;
+}) {
+  const getThreshold = (category: string): string => {
+    return value.find((s) => s.category === category)?.threshold ?? "BLOCK_MEDIUM_AND_ABOVE";
+  };
+
+  const setThreshold = (category: string, threshold: string) => {
+    const next = GEMINI_HARM_CATEGORIES.map((c) => ({
+      category: c.value,
+      threshold: c.value === category ? threshold : getThreshold(c.value),
+    }));
+    onChange(next);
+  };
+
+  return (
+    <div className="px-6 py-4 space-y-3">
+      <p className="text-xs text-muted-foreground">
+        Set the blocking threshold for each harm category. "Off" disables the filter entirely
+        (default for Gemini 2.5+). Lower thresholds block more content.{" "}
+        <a
+          href="https://ai.google.dev/gemini-api/docs/safety-settings"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="underline hover:text-foreground transition-colors"
+        >
+          Learn more
+        </a>
+      </p>
+      <div className="space-y-2">
+        {GEMINI_HARM_CATEGORIES.map((cat) => (
+          <div key={cat.value} className="flex items-center justify-between gap-4">
+            <span className="text-sm">{cat.label}</span>
+            <Select
+              value={getThreshold(cat.value)}
+              onValueChange={(v) => setThreshold(cat.value, v)}
+            >
+              <SelectTrigger className="w-48 h-8 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {GEMINI_THRESHOLDS.map((t) => (
+                  <SelectItem key={t.value} value={t.value} className="text-xs">
+                    {t.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }

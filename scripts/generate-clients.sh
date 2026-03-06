@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-# Script to generate Python and TypeScript clients from OpenAPI spec using openapi-generator
+# Script to generate Python, TypeScript, and Go clients from OpenAPI spec
 # Note: Rust client is auto-generated at build time via build.rs (uses progenitor)
 # Usage: ./scripts/generate-clients.sh
 
@@ -24,6 +24,7 @@ echo "This script generates clients for:"
 echo "  - Rust (via progenitor in build.rs)"
 echo "  - Python (via openapi-generator)"
 echo "  - TypeScript (via @hey-api/openapi-ts)"
+echo "  - Go (via ogen)"
 echo ""
 
 # Check if OpenAPI spec exists
@@ -105,8 +106,10 @@ echo "Generating new client with openapi-generator..."
 cd "$PYTHON_CLIENT_DIR"
 
 # Run openapi-generator via Docker (pinned version for reproducibility)
+# Use --platform linux/amd64 to ensure identical output on both macOS (arm64) and Linux CI (amd64)
 # Use --user to match current user's UID/GID so generated files are writable
 docker run --rm \
+    --platform linux/amd64 \
     --user "$(id -u):$(id -g)" \
     -v "$OPENAPI_SPEC:/local/openapi.json" \
     -v "$PYTHON_CLIENT_DIR:/local/out" \
@@ -333,6 +336,80 @@ npm run generate
 echo "✓ TypeScript client generated at $TYPESCRIPT_CLIENT_DIR"
 echo ""
 
+# Generate Go client
+echo "=================================================="
+echo "Generating Go client..."
+echo "=================================================="
+
+GO_CLIENT_DIR="$CLIENTS_DIR/go"
+
+if ! command -v go &> /dev/null; then
+    echo "⚠ Go not found, skipping Go client generation"
+    echo "  Install Go 1.25+ from https://go.dev/dl/"
+else
+    echo "Regenerating Go client (via OpenAPI Generator Docker)..."
+    cd "$GO_CLIENT_DIR"
+
+    # Save maintained files to temp
+    TEMP_DIR=$(mktemp -d)
+    echo "Preserving maintained files..."
+    [ -f "README.md" ] && cp README.md "$TEMP_DIR/"
+    [ -f "integration_test.go" ] && cp integration_test.go "$TEMP_DIR/"
+    [ -f "null_test.go" ] && cp null_test.go "$TEMP_DIR/"
+    [ -f "trace_test.go" ] && cp trace_test.go "$TEMP_DIR/"
+    [ -f "hindsight_client.go" ] && cp hindsight_client.go "$TEMP_DIR/"
+
+    # Remove old generated files
+    echo "Removing old generated code..."
+    rm -f api_*.go model_*.go client.go configuration.go response.go utils.go
+    rm -rf docs/ .openapi-generator/
+    rm -f go.mod go.sum
+
+    # Generate new client via Docker (--platform linux/amd64 ensures identical output on macOS and Linux CI)
+    echo "Generating client from OpenAPI spec..."
+    docker run --rm \
+        --platform linux/amd64 \
+        --user "$(id -u):$(id -g)" \
+        -v "$OPENAPI_SPEC:/local/openapi.json" \
+        -v "$GO_CLIENT_DIR:/local/out" \
+        "openapitools/openapi-generator-cli:${OPENAPI_GENERATOR_VERSION}" generate \
+        -i /local/openapi.json \
+        -g go \
+        -o /local/out \
+        --package-name hindsight \
+        --git-user-id vectorize-io \
+        --git-repo-id hindsight/hindsight-clients/go \
+        --global-property apiDocs=false,apiTests=false,modelDocs=false,modelTests=false
+
+    # Remove OpenAPI Generator boilerplate files
+    echo "Removing boilerplate files..."
+    rm -rf docs/ git_push.sh .travis.yml .gitlab-ci.yml .openapi-generator-ignore .openapi-generator/
+
+    # Restore maintained files from temp
+    echo "Restoring maintained files..."
+    [ -f "$TEMP_DIR/README.md" ] && mv "$TEMP_DIR/README.md" .
+    [ -f "$TEMP_DIR/integration_test.go" ] && mv "$TEMP_DIR/integration_test.go" .
+    [ -f "$TEMP_DIR/null_test.go" ] && mv "$TEMP_DIR/null_test.go" .
+    [ -f "$TEMP_DIR/trace_test.go" ] && mv "$TEMP_DIR/trace_test.go" .
+    [ -f "$TEMP_DIR/hindsight_client.go" ] && mv "$TEMP_DIR/hindsight_client.go" .
+    rm -rf "$TEMP_DIR"
+
+    # Fix known generator issue: api_files.go uses os.File but generator omits "os" import
+    if [ -f "api_files.go" ] && grep -q 'os\.File' api_files.go && ! grep -q '"os"' api_files.go; then
+        echo "Patching api_files.go: adding missing 'os' import..."
+        sed -i.bak 's|"net/url"|"net/url"\n\t"os"|' api_files.go
+        rm -f api_files.go.bak
+    fi
+
+    # Initialize module and build
+    echo "Building Go client..."
+    go mod tidy
+    go build ./...
+
+    echo "✓ Go client generated at $GO_CLIENT_DIR"
+fi
+echo ""
+
 echo "=================================================="
 echo "✅ Client generation complete!"
 echo "=================================================="
@@ -340,6 +417,7 @@ echo ""
 echo "Rust client:       $RUST_CLIENT_DIR"
 echo "Python client:     $PYTHON_CLIENT_DIR"
 echo "TypeScript client: $TYPESCRIPT_CLIENT_DIR"
+echo "Go client:         $GO_CLIENT_DIR"
 echo ""
 echo "⚠️  Important: The maintained wrapper hindsight_client.py and README.md were preserved"
 echo ""

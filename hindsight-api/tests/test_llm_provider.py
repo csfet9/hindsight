@@ -226,6 +226,7 @@ async def test_llm_provider_api_methods(provider: str, model: str):
 
 @pytest.mark.parametrize("provider,model", MODEL_MATRIX)
 @pytest.mark.asyncio
+@pytest.mark.timeout(300)
 async def test_llm_provider_memory_operations(provider: str, model: str):
     """
     Test LLM provider with actual memory operations: fact extraction and reflect.
@@ -331,8 +332,8 @@ async def test_llm_provider_consolidation(memory_no_llm_verify, request_context,
     test_bank_id = f"llm_test_consolidation_{provider}_{model}_{datetime.now().timestamp()}"
 
     # Enable observations for this bank
-    from hindsight_api.config import get_config
-    config = get_config()
+    from hindsight_api.config import _get_raw_config
+    config = _get_raw_config()
     original_value = config.enable_observations
     config.enable_observations = True
 

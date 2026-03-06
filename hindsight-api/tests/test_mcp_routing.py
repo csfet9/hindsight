@@ -46,12 +46,11 @@ async def test_mcp_tools_use_context_bank_id(mock_memory):
     assert "retain" in tools
     assert "recall" in tools
 
-    # Test retain with bank_id from context (use async_processing=False for synchronous test)
     token = _current_bank_id.set("context-bank-id")
     try:
         retain_tool = tools["retain"]
-        result = await retain_tool.fn(content="test content", context="test_context", async_processing=False)
-        assert "successfully" in result.lower()
+        result = await retain_tool.fn(content="test content", context="test_context")
+        assert result["status"] == "accepted"
 
         # Verify the memory was called with the context bank_id
         mock_memory.submit_async_retain.assert_called_once()
@@ -133,12 +132,12 @@ async def test_mcp_tools_propagate_api_key(mock_memory):
     api_key_token = _current_api_key.set("test-bearer-token")
     try:
         retain_tool = tools["retain"]
-        result = await retain_tool.fn(content="test content", context="test_context", async_processing=False)
-        assert "successfully" in result.lower()
+        result = await retain_tool.fn(content="test content", context="test_context")
+        assert result["status"] == "accepted"
 
         # Verify the memory was called with request_context containing api_key
-        mock_memory.retain_batch_async.assert_called_once()
-        call_kwargs = mock_memory.retain_batch_async.call_args.kwargs
+        mock_memory.submit_async_retain.assert_called_once()
+        call_kwargs = mock_memory.submit_async_retain.call_args.kwargs
         assert call_kwargs["request_context"].api_key == "test-bearer-token"
     finally:
         _current_bank_id.reset(bank_token)
@@ -200,11 +199,11 @@ async def test_mcp_tools_propagate_tenant_id_and_api_key_id(mock_memory):
     key_id_token = _current_api_key_id.set("key-uuid-456")
     try:
         retain_tool = tools["retain"]
-        await retain_tool.fn(content="test content", context="test_context", async_processing=False)
+        await retain_tool.fn(content="test content", context="test_context")
 
         # Verify the RequestContext passed to memory engine has all auth fields
-        mock_memory.retain_batch_async.assert_called_once()
-        request_context = mock_memory.retain_batch_async.call_args.kwargs["request_context"]
+        mock_memory.submit_async_retain.assert_called_once()
+        request_context = mock_memory.submit_async_retain.call_args.kwargs["request_context"]
         assert request_context.api_key == "hsk_test_key"
         assert request_context.tenant_id == "org-billing-123"
         assert request_context.api_key_id == "key-uuid-456"
@@ -350,6 +349,69 @@ async def test_middleware_handles_both_endpoints(mock_memory):
     assert "create_mental_model" in single_bank_tools
     assert "list_banks" not in single_bank_tools
     assert "create_bank" not in single_bank_tools
+
+
+def test_global_mcp_enabled_tools_filter_restricts_registered_tools(mock_memory):
+    """Test that global mcp_enabled_tools env setting restricts which tools are registered."""
+    from unittest.mock import MagicMock, patch
+
+    from hindsight_api.api.mcp import create_mcp_server
+
+    mock_cfg = MagicMock()
+    mock_cfg.mcp_enabled_tools = ["retain", "recall"]
+
+    with patch("hindsight_api.api.mcp._get_raw_config", return_value=mock_cfg):
+        mcp_server = create_mcp_server(mock_memory, multi_bank=True)
+
+    tools = mcp_server._tool_manager._tools
+    assert "retain" in tools
+    assert "recall" in tools
+    assert "reflect" not in tools
+    assert "list_banks" not in tools
+    assert "create_bank" not in tools
+    assert "list_mental_models" not in tools
+
+
+def test_global_mcp_enabled_tools_none_exposes_all_tools(mock_memory):
+    """Test that mcp_enabled_tools=None (default) exposes all tools."""
+    from unittest.mock import MagicMock, patch
+
+    from hindsight_api.api.mcp import create_mcp_server
+
+    mock_cfg = MagicMock()
+    mock_cfg.mcp_enabled_tools = None
+
+    with patch("hindsight_api.api.mcp._get_raw_config", return_value=mock_cfg):
+        mcp_server = create_mcp_server(mock_memory, multi_bank=True)
+
+    tools = mcp_server._tool_manager._tools
+    assert "retain" in tools
+    assert "recall" in tools
+    assert "reflect" in tools
+    assert "list_banks" in tools
+    assert "create_bank" in tools
+
+
+def test_global_mcp_enabled_tools_intersects_with_single_bank_mode(mock_memory):
+    """Test that global filter intersects with single-bank mode tool set.
+
+    list_banks is in the global allowlist but NOT in single-bank mode, so it
+    should be absent from the final registered set.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from hindsight_api.api.mcp import create_mcp_server
+
+    mock_cfg = MagicMock()
+    mock_cfg.mcp_enabled_tools = ["retain", "recall", "list_banks"]
+
+    with patch("hindsight_api.api.mcp._get_raw_config", return_value=mock_cfg):
+        mcp_server = create_mcp_server(mock_memory, multi_bank=False)
+
+    tools = mcp_server._tool_manager._tools
+    assert "retain" in tools
+    assert "recall" in tools
+    assert "list_banks" not in tools  # single-bank mode excludes it regardless
 
 
 @pytest.mark.asyncio

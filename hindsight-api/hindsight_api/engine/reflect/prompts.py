@@ -10,59 +10,30 @@ The reflect agent uses hierarchical retrieval:
 import json
 from typing import Any
 
+import tiktoken
+
+_TIKTOKEN_ENCODING = tiktoken.get_encoding("cl100k_base")
+
+# Fraction of max_context_tokens reserved for tool results in the final synthesis prompt.
+# The remainder covers the system prompt, question, bank context, and output tokens.
+_FINAL_PROMPT_CONTEXT_FRACTION = 0.8
+
 
 def _extract_directive_rules(directives: list[dict[str, Any]]) -> list[str]:
-    """
-    Extract directive rules as a list of strings.
-
-    Args:
-        directives: List of directives with name and content
-
-    Returns:
-        List of directive rule strings
-    """
+    """Extract directive rules as a list of strings."""
     rules = []
     for directive in directives:
-        directive_name = directive.get("name", "")
-        # New format: directives have direct content field
+        name = directive.get("name", "")
         content = directive.get("content", "")
         if content:
-            if directive_name:
-                rules.append(f"**{directive_name}**: {content}")
-            else:
-                rules.append(content)
-        else:
-            # Legacy format: check for observations
-            observations = directive.get("observations", [])
-            if observations:
-                for obs in observations:
-                    # Support both Pydantic Observation objects and dicts
-                    if hasattr(obs, "title"):
-                        title = obs.title
-                        obs_content = obs.content
-                    else:
-                        title = obs.get("title", "")
-                        obs_content = obs.get("content", "")
-                    if title and obs_content:
-                        rules.append(f"**{title}**: {obs_content}")
-                    elif obs_content:
-                        rules.append(obs_content)
-            elif directive_name:
-                # Fallback to description
-                desc = directive.get("description", "")
-                if desc:
-                    rules.append(f"**{directive_name}**: {desc}")
+            rules.append(f"**{name}**: {content}" if name else content)
     return rules
 
 
 def build_directives_section(directives: list[dict[str, Any]]) -> str:
-    """
-    Build the directives section for the system prompt.
+    """Build the directives section for the system prompt.
 
     Directives are hard rules that MUST be followed in all responses.
-
-    Args:
-        directives: List of directive mental models with observations
     """
     if not directives:
         return ""
@@ -169,6 +140,12 @@ def build_system_prompt_for_tools(
 
     parts.extend(
         [
+            "## LANGUAGE RULE (default - directives take precedence)",
+            "- By default, detect the language of the user's question and respond in that SAME language.",
+            "- If the question is in Chinese, respond in Chinese. If in Japanese, respond in Japanese.",
+            "- IMPORTANT: The DIRECTIVES section above has HIGHER PRIORITY than this rule.",
+            "  If a directive specifies a language (e.g. 'Always respond in French'), follow the directive.",
+            "",
             "## CRITICAL RULES",
             "- ONLY use information from tool results - no external knowledge or guessing",
             "- You SHOULD synthesize, infer, and reason from the retrieved memories",
@@ -205,6 +182,7 @@ def build_system_prompt_for_tools(
                 "### 3. RAW FACTS (recall) - Ground Truth",
                 "- Individual memories (world facts and experiences)",
                 "- Use when: no mental models/observations exist, they're stale, or you need specific details",
+                "- MANDATORY: If search_mental_models and search_observations both return 0 results, you MUST call recall() before giving up",
                 "- This is the source of truth that other levels are built from",
                 "",
             ]
@@ -222,6 +200,7 @@ def build_system_prompt_for_tools(
                 "### 2. RAW FACTS (recall) - Ground Truth",
                 "- Individual memories (world facts and experiences)",
                 "- Use when: no observations exist, they're stale, or you need specific details",
+                "- MANDATORY: If search_observations returns 0 results or count=0, you MUST call recall() before giving up",
                 "- This is the source of truth that observations are built from",
                 "",
             ]
@@ -299,7 +278,7 @@ def build_system_prompt_for_tools(
         parts.extend(
             [
                 "1. First, try search_observations() - check for consolidated knowledge",
-                "2. If observations are stale OR you need specific details, use recall() for raw facts",
+                "2. If search_observations returns 0 results OR observations are stale, you MUST call recall() for raw facts",
                 "3. Use expand() if you need more context on specific memories",
                 "4. When ready, call done() with your answer and supporting IDs",
             ]
@@ -315,6 +294,7 @@ def build_system_prompt_for_tools(
             "- Format for clarity and readability with proper spacing and hierarchy",
             "- NEVER include memory IDs, UUIDs, or 'Memory references' in the answer text",
             "- Put IDs ONLY in the memory_ids/mental_model_ids/observation_ids arrays, not in the answer",
+            "- CRITICAL: This is a NON-CONVERSATIONAL system. NEVER ask follow-up questions, offer further assistance, or suggest next steps. Your answer must be complete and self-contained. The user cannot reply.",
         ]
     )
 
@@ -422,6 +402,7 @@ def build_final_prompt(
     context_history: list[dict],
     bank_profile: dict,
     additional_context: str | None = None,
+    max_context_tokens: int = 100_000,
 ) -> str:
     """Build the final prompt when forcing a text response (no tools)."""
     parts = []
@@ -451,18 +432,32 @@ def build_final_prompt(
     if additional_context:
         parts.append(f"\n## Additional Context\n{additional_context}")
 
-    # Tool call history
+    # Tool call history — include as many entries as fit within the token budget,
+    # preferring the most recent calls (they tend to be the most targeted).
     if context_history:
         parts.append("\n## Retrieved Data (synthesize and reason from this data)")
-        for entry in context_history:
+        token_budget = int(max_context_tokens * _FINAL_PROMPT_CONTEXT_FRACTION)
+        # Render entries newest-first, then reverse so the prompt reads chronologically.
+        rendered: list[str] = []
+        truncated = False
+        for entry in reversed(context_history):
             tool = entry["tool"]
             output = entry["output"]
-            # Format as proper JSON for LLM readability
             try:
                 output_str = json.dumps(output, indent=2, default=str)
             except (TypeError, ValueError):
                 output_str = str(output)
-            parts.append(f"\n### From {tool}:\n```json\n{output_str}\n```")
+            block = f"\n### From {tool}:\n```json\n{output_str}\n```"
+            block_tokens = len(_TIKTOKEN_ENCODING.encode(block))
+            if block_tokens > token_budget:
+                truncated = True
+                break
+            rendered.append(block)
+            token_budget -= block_tokens
+        for block in reversed(rendered):
+            parts.append(block)
+        if truncated:
+            parts.append("\n*Note: Some earlier tool results were omitted to stay within the context window.*")
     else:
         parts.append("\n## Retrieved Data\nNo data was retrieved.")
 
@@ -510,4 +505,6 @@ CRITICAL: Output ONLY the final synthesized answer. Do NOT include:
 - Meta-commentary about what you're doing ("I'll search...", "Let me analyze...")
 - Explanations of your reasoning process
 - Descriptions of your approach
-Just provide the direct answer with proper markdown formatting."""
+Just provide the direct answer with proper markdown formatting.
+
+CRITICAL: This is a NON-CONVERSATIONAL system. NEVER ask follow-up questions, offer to search again, suggest alternatives, or end with anything like "Would you like me to..." or "Let me know if...". The user cannot reply. Your answer must be complete and self-contained."""

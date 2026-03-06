@@ -47,7 +47,8 @@ TOOL_SEARCH_OBSERVATIONS = {
         "description": (
             "Search consolidated observations (auto-generated knowledge). These are automatically "
             "synthesized from memories. Returns observations with freshness info (updated_at, is_stale). "
-            "If an observation is STALE, you should ALSO use recall() to verify with current facts."
+            "If an observation is STALE, you should ALSO use recall() to verify with current facts. "
+            "IMPORTANT: If search_mental_models is available, you MUST call it FIRST before using this tool."
         ),
         "parameters": {
             "type": "object",
@@ -95,6 +96,10 @@ TOOL_RECALL = {
                     "type": "integer",
                     "description": "Optional limit on result size (default 2048). Use higher values for broader searches.",
                 },
+                "max_chunk_tokens": {
+                    "type": "integer",
+                    "description": "Maximum tokens for raw source chunk text included alongside each memory fact (default 1000, min 1000). Chunks provide the surrounding context the fact was extracted from. Increase for broader context.",
+                },
             },
             "required": ["reason", "query"],
         },
@@ -139,7 +144,7 @@ TOOL_DONE_ANSWER = {
             "properties": {
                 "answer": {
                     "type": "string",
-                    "description": "Your response as well-formatted markdown. Use headers, lists, bold/italic, and code blocks for clarity. NEVER include memory IDs, UUIDs, or 'Memory references' in this text - put IDs only in memory_ids array.",
+                    "description": "Your response as well-formatted markdown. Use headers, lists, bold/italic, and code blocks for clarity. NEVER include memory IDs, UUIDs, or 'Memory references' in this text - put IDs only in memory_ids array. LANGUAGE: By default, write in the SAME language as the user's question. However, if a language directive in the system prompt specifies a different language, follow that directive instead.",
                 },
                 "memory_ids": {
                     "type": "array",
@@ -190,7 +195,11 @@ def _build_done_tool_with_directives(directive_rules: list[str]) -> dict:
                 "properties": {
                     "answer": {
                         "type": "string",
-                        "description": "Your response as well-formatted markdown. Use headers, lists, bold/italic, and code blocks for clarity. NEVER include memory IDs, UUIDs, or 'Memory references' in this text - put IDs only in memory_ids array.",
+                        "description": (
+                            "Your response as well-formatted markdown. Use headers, lists, bold/italic, and code blocks for clarity. "
+                            "NEVER include memory IDs, UUIDs, or 'Memory references' in this text - put IDs only in memory_ids array. "
+                            f"MANDATORY: Your answer MUST comply with ALL directives:\n{rules_list}"
+                        ),
                     },
                     "memory_ids": {
                         "type": "array",

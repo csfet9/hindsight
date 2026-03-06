@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
+import { toast } from "sonner";
 import { BankSelector } from "@/components/bank-selector";
 import { Sidebar } from "@/components/sidebar";
 import { DataView } from "@/components/data-view";
@@ -14,6 +15,7 @@ import { BankConfigView } from "@/components/bank-config-view";
 import { BankStatsView } from "@/components/bank-stats-view";
 import { BankOperationsView } from "@/components/bank-operations-view";
 import { MentalModelsView } from "@/components/mental-models-view";
+import { WebhooksView } from "@/components/webhooks-view";
 import { useFeatures } from "@/lib/features-context";
 import { useBank } from "@/lib/bank-context";
 import { client } from "@/lib/api";
@@ -35,11 +37,11 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Brain, Trash2, Loader2, MoreVertical, Pencil } from "lucide-react";
+import { Brain, Trash2, Loader2, MoreVertical, Pencil, RotateCcw } from "lucide-react";
 
 type NavItem = "recall" | "reflect" | "data" | "documents" | "entities" | "profile";
 type DataSubTab = "world" | "experience" | "observations" | "mental-models";
-type BankConfigTab = "general" | "configuration";
+type BankConfigTab = "general" | "configuration" | "webhooks";
 
 export default function BankPage() {
   const params = useParams();
@@ -60,6 +62,8 @@ export default function BankPage() {
   const [showClearObservationsDialog, setShowClearObservationsDialog] = useState(false);
   const [isClearingObservations, setIsClearingObservations] = useState(false);
   const [isConsolidating, setIsConsolidating] = useState(false);
+  const [showResetConfigDialog, setShowResetConfigDialog] = useState(false);
+  const [isResettingConfig, setIsResettingConfig] = useState(false);
 
   const handleTabChange = (tab: NavItem) => {
     router.push(`/banks/${bankId}?view=${tab}`);
@@ -84,8 +88,7 @@ export default function BankPage() {
       await loadBanks();
       router.push("/");
     } catch (error) {
-      console.error("Error deleting bank:", error);
-      alert("Error deleting bank: " + (error as Error).message);
+      // Error toast is shown automatically by the API client interceptor
     } finally {
       setIsDeleting(false);
     }
@@ -98,12 +101,26 @@ export default function BankPage() {
     try {
       const result = await client.clearObservations(bankId);
       setShowClearObservationsDialog(false);
-      alert(result.message || "Observations cleared successfully");
+      toast.success("Success", {
+        description: result.message || "Observations cleared successfully",
+      });
     } catch (error) {
-      console.error("Error clearing observations:", error);
-      alert("Error clearing observations: " + (error as Error).message);
+      // Error toast is shown automatically by the API client interceptor
     } finally {
       setIsClearingObservations(false);
+    }
+  };
+
+  const handleResetConfig = async () => {
+    if (!bankId) return;
+    setIsResettingConfig(true);
+    try {
+      await client.resetBankConfig(bankId);
+      setShowResetConfigDialog(false);
+    } catch {
+      // Error toast shown by API client interceptor
+    } finally {
+      setIsResettingConfig(false);
     }
   };
 
@@ -114,8 +131,7 @@ export default function BankPage() {
     try {
       await client.triggerConsolidation(bankId);
     } catch (error) {
-      console.error("Error triggering consolidation:", error);
-      alert("Error triggering consolidation: " + (error as Error).message);
+      // Error toast is shown automatically by the API client interceptor
     } finally {
       setIsConsolidating(false);
     }
@@ -181,6 +197,19 @@ export default function BankPage() {
                       </DropdownMenuItem>
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
+                        onClick={() => setShowResetConfigDialog(true)}
+                        disabled={!bankConfigEnabled}
+                        className="text-amber-600 dark:text-amber-400 focus:text-amber-700 dark:focus:text-amber-300"
+                        title={!bankConfigEnabled ? "Bank Config API is disabled" : undefined}
+                      >
+                        <RotateCcw className="w-4 h-4 mr-2" />
+                        Reset Configuration
+                        {!bankConfigEnabled && (
+                          <span className="ml-auto text-xs text-muted-foreground">Off</span>
+                        )}
+                      </DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
                         onClick={() => setShowDeleteDialog(true)}
                         className="text-red-600 dark:text-red-400 focus:text-red-700 dark:focus:text-red-300"
                       >
@@ -207,16 +236,31 @@ export default function BankPage() {
                         <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary" />
                       )}
                     </button>
+                    {bankConfigEnabled && (
+                      <button
+                        onClick={() => handleBankConfigTabChange("configuration")}
+                        className={`px-6 py-3 font-semibold text-sm transition-all relative ${
+                          bankConfigTab === "configuration"
+                            ? "text-primary"
+                            : "text-muted-foreground hover:text-foreground"
+                        }`}
+                      >
+                        Configuration
+                        {bankConfigTab === "configuration" && (
+                          <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary" />
+                        )}
+                      </button>
+                    )}
                     <button
-                      onClick={() => handleBankConfigTabChange("configuration")}
+                      onClick={() => handleBankConfigTabChange("webhooks")}
                       className={`px-6 py-3 font-semibold text-sm transition-all relative ${
-                        bankConfigTab === "configuration"
+                        bankConfigTab === "webhooks"
                           ? "text-primary"
                           : "text-muted-foreground hover:text-foreground"
                       }`}
                     >
-                      Configuration
-                      {bankConfigTab === "configuration" && (
+                      Webhooks
+                      {bankConfigTab === "webhooks" && (
                         <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary" />
                       )}
                     </button>
@@ -233,19 +277,22 @@ export default function BankPage() {
                       <div className="space-y-6">
                         <BankStatsView />
                         <BankOperationsView />
+                        <BankProfileView hideReflectFields />
                       </div>
                     </div>
                   )}
-                  {bankConfigTab === "configuration" && (
+                  {bankConfigTab === "configuration" && bankConfigEnabled && (
+                    <div className="space-y-6">
+                      <BankConfigView />
+                    </div>
+                  )}
+                  {bankConfigTab === "webhooks" && (
                     <div>
-                      <p className="text-sm text-muted-foreground mb-6">
-                        Configure disposition traits, mission, directives, and behavioral settings
-                        for this bank.
+                      <p className="text-sm text-muted-foreground mb-4">
+                        Manage webhook endpoints to receive event notifications from this memory
+                        bank.
                       </p>
-                      <div className="space-y-6">
-                        <BankProfileView />
-                        {bankConfigEnabled && <BankConfigView />}
-                      </div>
+                      <WebhooksView />
                     </div>
                   )}
                 </div>
@@ -474,6 +521,43 @@ export default function BankPage() {
                 <>
                   <Trash2 className="w-4 h-4 mr-2" />
                   Delete Bank
+                </>
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Reset Configuration Confirmation Dialog */}
+      <AlertDialog open={showResetConfigDialog} onOpenChange={setShowResetConfigDialog}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Reset Configuration</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-2 text-sm text-muted-foreground">
+                <p>
+                  Are you sure you want to reset all configuration overrides for{" "}
+                  <span className="font-semibold text-foreground">{bankId}</span>?
+                </p>
+                <p className="text-amber-600 dark:text-amber-400 font-medium">
+                  All per-bank settings (retain, observations, reflect) will revert to server
+                  defaults. This does not affect memories, entities, or the bank profile.
+                </p>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isResettingConfig}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleResetConfig} disabled={isResettingConfig}>
+              {isResettingConfig ? (
+                <>
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  Resetting...
+                </>
+              ) : (
+                <>
+                  <RotateCcw className="w-4 h-4 mr-2" />
+                  Reset Configuration
                 </>
               )}
             </AlertDialogAction>

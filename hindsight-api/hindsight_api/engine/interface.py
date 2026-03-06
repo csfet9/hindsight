@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from hindsight_api.engine.memory_engine import Budget
     from hindsight_api.engine.response_models import RecallResult, ReflectResult
+    from hindsight_api.engine.search.tags import TagsMatch
     from hindsight_api.models import RequestContext
 
 
@@ -48,6 +49,7 @@ class MemoryEngineInterface(ABC):
         contents: list[dict[str, Any]],
         *,
         request_context: "RequestContext",
+        document_tags: list[str] | None = None,
     ) -> dict[str, Any]:
         """
         Retain a batch of memory items.
@@ -55,8 +57,9 @@ class MemoryEngineInterface(ABC):
         Args:
             bank_id: The memory bank ID.
             contents: List of content dicts with 'content', optional 'event_date',
-                     'context', 'metadata', 'document_id'.
+                     'context', 'metadata', 'document_id', and per-item 'tags'.
             request_context: Request context for authentication.
+            document_tags: Optional tags applied to all items in the batch.
 
         Returns:
             Dict with processing results.
@@ -335,6 +338,8 @@ class MemoryEngineInterface(ABC):
         bank_id: str,
         *,
         search_query: str | None = None,
+        tags: list[str] | None = None,
+        tags_match: "TagsMatch" = "any_strict",
         limit: int = 100,
         offset: int = 0,
         request_context: "RequestContext",
@@ -344,7 +349,9 @@ class MemoryEngineInterface(ABC):
 
         Args:
             bank_id: The memory bank ID.
-            search_query: Search query.
+            search_query: Case-insensitive substring filter on document ID.
+            tags: Filter by tags.
+            tags_match: How to match tags (any, all, any_strict, all_strict).
             limit: Maximum results.
             offset: Pagination offset.
             request_context: Request context for authentication.
@@ -561,6 +568,7 @@ class MemoryEngineInterface(ABC):
         contents: list[dict[str, Any]],
         *,
         request_context: "RequestContext",
+        document_tags: list[str] | None = None,
     ) -> dict[str, Any]:
         """
         Submit a batch retain operation to run asynchronously.
@@ -569,6 +577,7 @@ class MemoryEngineInterface(ABC):
             bank_id: The memory bank ID.
             contents: List of content dicts to retain.
             request_context: Request context for authentication.
+            document_tags: Optional tags applied to all items in the async batch.
 
         Returns:
             Dict with operation_id and items_count.

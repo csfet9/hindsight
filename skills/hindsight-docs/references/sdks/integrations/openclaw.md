@@ -30,7 +30,7 @@ export GROQ_API_KEY="your-key"
 # Option E: Claude Code (uses claude-sonnet-4-20250514, no API key needed)
 export HINDSIGHT_API_LLM_PROVIDER=claude-code
 
-# Option F: OpenAI Codex (uses o3-mini, no API key needed)
+# Option F: OpenAI Codex (uses gpt-4o-mini, no API key needed)
 export HINDSIGHT_API_LLM_PROVIDER=openai-codex
 ```
 
@@ -90,7 +90,70 @@ Optional settings in `~/.openclaw/openclaw.json`:
 - `apiPort` - Port for the openclaw profile daemon (default: `9077`)
 - `daemonIdleTimeout` - Seconds before daemon shuts down from inactivity (default: `0` = never)
 - `embedVersion` - hindsight-embed version (default: `"latest"`)
-- `bankMission` - Custom context for the memory bank (optional)
+- `bankMission` - Agent identity/purpose stored on the memory bank. Helps the memory engine understand context for better fact extraction during retain. Set once per bank on first use — not a recall prompt.
+- `dynamicBankId` - Enable per-context memory banks (default: `true`)
+- `bankIdPrefix` - Optional prefix for bank IDs (e.g. `"prod"` → `"prod-slack-C123"`)
+- `dynamicBankGranularity` - Fields used to derive bank ID: `agent`, `channel`, `user`, `provider` (default: `["agent", "channel", "user"]`)
+- `excludeProviders` - Message providers to skip for recall/retain (e.g. `["slack"]`, `["telegram"]`, `["discord"]`)
+- `autoRecall` - Auto-inject memories before each turn (default: `true`). Set to `false` when the agent has its own recall tool.
+- `autoRetain` - Auto-retain conversations after each turn (default: `true`)
+- `retainRoles` - Which message roles to retain (default: `["user", "assistant"]`). Options: `user`, `assistant`, `system`, `tool`
+- `recallBudget` - Recall effort: `"low"`, `"mid"`, or `"high"` (default: `"mid"`). Higher budgets use more retrieval strategies for better results.
+- `recallMaxTokens` - Max tokens for recall response (default: `1024`). Controls how much memory context is injected per turn.
+
+### Memory Isolation
+
+The plugin creates separate memory banks based on conversation context. By default, banks are derived from the `agent`, `channel`, and `user` fields — so each unique combination gets its own isolated memory store.
+
+You can customize which fields are used for bank segmentation with `dynamicBankGranularity`:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "hindsight-openclaw": {
+        "enabled": true,
+        "config": {
+          "dynamicBankGranularity": ["provider", "user"]
+        }
+      }
+    }
+  }
+}
+```
+
+In this example, memories are isolated per provider + user, meaning the same user shares memories across all channels within a provider.
+
+Available isolation fields:
+- `agent` - The agent/bot identity
+- `channel` - The channel or conversation ID
+- `user` - The user interacting with the agent
+- `provider` - The message provider (e.g. Slack, Discord)
+
+Use `bankIdPrefix` to namespace bank IDs across environments (e.g. `"prod"`, `"staging"`). Set `dynamicBankId` to `false` to use a single shared bank for all conversations.
+
+### Retention Controls
+
+By default, the plugin retains `user` and `assistant` messages after each turn. You can customize this behavior:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "hindsight-openclaw": {
+        "enabled": true,
+        "config": {
+          "autoRetain": true,
+          "retainRoles": ["user", "assistant", "system"]
+        }
+      }
+    }
+  }
+}
+```
+
+- `autoRetain` - Set to `false` to disable automatic retention entirely (useful if you handle retention yourself)
+- `retainRoles` - Controls which message roles are included in the retained transcript. Only messages from the last user message onward are retained each turn, preventing duplicate storage.
 
 ### LLM Configuration
 
@@ -103,7 +166,7 @@ The plugin auto-detects your LLM provider from these environment variables:
 | Gemini | `GEMINI_API_KEY` | `gemini-2.5-flash` | |
 | Groq | `GROQ_API_KEY` | `openai/gpt-oss-20b` | |
 | Claude Code | `HINDSIGHT_API_LLM_PROVIDER=claude-code` | `claude-sonnet-4-20250514` | No API key needed |
-| OpenAI Codex | `HINDSIGHT_API_LLM_PROVIDER=openai-codex` | `o3-mini` | No API key needed |
+| OpenAI Codex | `HINDSIGHT_API_LLM_PROVIDER=openai-codex` | `gpt-4o-mini` | No API key needed |
 
 **Override with explicit config:**
 

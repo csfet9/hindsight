@@ -36,8 +36,10 @@ import type {
     RecallResult,
     ReflectRequest,
     ReflectResponse,
+    FileRetainResponse,
     ListMemoryUnitsResponse,
     BankProfileResponse,
+    BankConfigResponse,
     CreateBankRequest,
     Budget,
 } from '../generated/types.gen';
@@ -48,6 +50,22 @@ export interface HindsightClientOptions {
      * Optional API key for authentication (sent as Bearer token in Authorization header)
      */
     apiKey?: string;
+}
+
+/**
+ * Error thrown by the Hindsight client when an API request fails.
+ * Includes the HTTP status code and error details from the API.
+ */
+export class HindsightError extends Error {
+    public statusCode?: number;
+    public details?: unknown;
+
+    constructor(message: string, statusCode?: number, details?: unknown) {
+        super(message);
+        this.name = 'HindsightError';
+        this.statusCode = statusCode;
+        this.details = details;
+    }
 }
 
 export interface EntityInput {
@@ -63,6 +81,7 @@ export interface MemoryItemInput {
     document_id?: string;
     entities?: EntityInput[];
     tags?: string[];
+    observation_scopes?: "per_tag" | "combined" | "all_combinations" | string[][];
 }
 
 export class HindsightClient {
@@ -82,9 +101,22 @@ export class HindsightClient {
     /**
      * Validates the API response and throws an error if the request failed.
      */
-    private validateResponse<T>(response: { data?: T; error?: unknown }, operation: string): T {
+    private validateResponse<T>(response: { data?: T; error?: unknown; response?: Response }, operation: string): T {
         if (!response.data) {
-            throw new Error(`${operation} failed: ${JSON.stringify(response.error || 'Unknown error')}`);
+            // The generated client returns { error, response, request }
+            // Status code is in response.status, not in the error object
+            const error = response.error as any;
+            const httpResponse = (response as any).response as Response | undefined;
+
+            // Extract status code from the HTTP response object
+            const statusCode = httpResponse?.status;
+            const details = error?.detail || error?.message || error;
+
+            throw new HindsightError(
+                `${operation} failed: ${JSON.stringify(details)}`,
+                statusCode,
+                details
+            );
         }
         return response.data;
     }
@@ -157,6 +189,7 @@ export class HindsightClient {
             document_id: item.document_id,
             entities: item.entities,
             tags: item.tags,
+            observation_scopes: item.observation_scopes,
             timestamp:
                 item.timestamp instanceof Date
                     ? item.timestamp.toISOString()
@@ -183,6 +216,40 @@ export class HindsightClient {
     }
 
     /**
+     * Upload files and retain their contents as memories.
+     *
+     * Files are automatically converted to text (PDF, DOCX, images via OCR, audio via
+     * transcription, and more) and ingested as memories. Processing is always asynchronous —
+     * use the returned operation IDs to track progress via the operations endpoint.
+     *
+     * @param bankId - The memory bank ID
+     * @param files - Array of File or Blob objects to upload
+     * @param options - Optional settings: context, documentTags, filesMetadata
+     */
+    async retainFiles(
+        bankId: string,
+        files: Array<File | Blob>,
+        options?: {
+            context?: string;
+            filesMetadata?: Array<{ context?: string; document_id?: string; tags?: string[]; metadata?: Record<string, string> }>;
+        }
+    ): Promise<FileRetainResponse> {
+        const meta = options?.filesMetadata ?? files.map(() => options?.context ? { context: options.context } : {});
+
+        const requestBody = JSON.stringify({
+            files_metadata: meta,
+        });
+
+        const response = await sdk.fileRetain({
+            client: this.client,
+            path: { bank_id: bankId },
+            body: { files, request: requestBody },
+        });
+
+        return this.validateResponse(response, 'retainFiles');
+    }
+
+    /**
      * Recall memories with a natural language query.
      */
     async recall(
@@ -198,6 +265,10 @@ export class HindsightClient {
             maxEntityTokens?: number;
             includeChunks?: boolean;
             maxChunkTokens?: number;
+            /** Include source facts for observation-type results */
+            includeSourceFacts?: boolean;
+            /** Maximum tokens for source facts (default: 4096) */
+            maxSourceFactsTokens?: number;
             /** Optional list of tags to filter memories by */
             tags?: string[];
             /** How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), 'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged). Default: 'any' */
@@ -215,8 +286,9 @@ export class HindsightClient {
                 trace: options?.trace,
                 query_timestamp: options?.queryTimestamp,
                 include: {
-                    entities: options?.includeEntities ? { max_tokens: options?.maxEntityTokens ?? 500 } : undefined,
+                    entities: options?.includeEntities === false ? null : options?.includeEntities ? { max_tokens: options?.maxEntityTokens ?? 500 } : undefined,
                     chunks: options?.includeChunks ? { max_tokens: options?.maxChunkTokens ?? 8192 } : undefined,
+                    source_facts: options?.includeSourceFacts ? { max_tokens: options?.maxSourceFactsTokens ?? 4096 } : undefined,
                 },
                 tags: options?.tags,
                 tags_match: options?.tagsMatch,
@@ -278,23 +350,71 @@ export class HindsightClient {
     }
 
     /**
-     * Create or update a bank with disposition and background.
+     * Create or update a bank with disposition, missions, and operational configuration.
      */
     async createBank(
         bankId: string,
-        options: { name?: string; background?: string; disposition?: any }
+        options: {
+            /** @deprecated Display label only. */
+            name?: string;
+            /** @deprecated Use reflectMission instead. */
+            mission?: string;
+            /** Mission/context for Reflect operations. */
+            reflectMission?: string;
+            /** @deprecated Alias for mission. */
+            background?: string;
+            /** @deprecated Use dispositionSkepticism, dispositionLiteralism, dispositionEmpathy instead. */
+            disposition?: { skepticism: number; literalism: number; empathy: number };
+            /** @deprecated Use updateBankConfig({ dispositionSkepticism }) instead. */
+            dispositionSkepticism?: number;
+            /** @deprecated Use updateBankConfig({ dispositionLiteralism }) instead. */
+            dispositionLiteralism?: number;
+            /** @deprecated Use updateBankConfig({ dispositionEmpathy }) instead. */
+            dispositionEmpathy?: number;
+            /** Steers what gets extracted during retain(). Injected alongside built-in rules. */
+            retainMission?: string;
+            /** Fact extraction mode: 'concise' (default), 'verbose', or 'custom'. */
+            retainExtractionMode?: string;
+            /** Custom extraction prompt (only active when retainExtractionMode is 'custom'). */
+            retainCustomInstructions?: string;
+            /** Maximum token size for each content chunk during retain. */
+            retainChunkSize?: number;
+            /** Toggle automatic observation consolidation after retain(). */
+            enableObservations?: boolean;
+            /** Controls what gets synthesised into observations. Replaces built-in rules. */
+            observationsMission?: string;
+        } = {}
     ): Promise<BankProfileResponse> {
         const response = await sdk.createOrUpdateBank({
             client: this.client,
             path: { bank_id: bankId },
             body: {
                 name: options.name,
+                mission: options.mission,
+                reflect_mission: options.reflectMission,
                 background: options.background,
                 disposition: options.disposition,
+                disposition_skepticism: options.dispositionSkepticism,
+                disposition_literalism: options.dispositionLiteralism,
+                disposition_empathy: options.dispositionEmpathy,
+                retain_mission: options.retainMission,
+                retain_extraction_mode: options.retainExtractionMode,
+                retain_custom_instructions: options.retainCustomInstructions,
+                retain_chunk_size: options.retainChunkSize,
+                enable_observations: options.enableObservations,
+                observations_mission: options.observationsMission,
             },
         });
 
         return this.validateResponse(response, 'createBank');
+    }
+
+    /**
+     * Set or update the reflect mission for a memory bank.
+     * @deprecated Use createBank({ reflectMission: '...' }) instead.
+     */
+    async setMission(bankId: string, mission: string): Promise<BankProfileResponse> {
+        return this.createBank(bankId, { reflectMission: mission });
     }
 
     /**
@@ -309,17 +429,81 @@ export class HindsightClient {
         return this.validateResponse(response, 'getBankProfile');
     }
 
+
     /**
-     * Set or update the mission for a memory bank.
+     * Get the resolved configuration for a bank, including any bank-level overrides.
+     *
+     * Can be disabled on the server by setting `HINDSIGHT_API_ENABLE_BANK_CONFIG_API=false`.
      */
-    async setMission(bankId: string, mission: string): Promise<BankProfileResponse> {
-        const response = await sdk.createOrUpdateBank({
+    async getBankConfig(bankId: string): Promise<BankConfigResponse> {
+        const response = await sdk.getBankConfig({
             client: this.client,
             path: { bank_id: bankId },
-            body: { mission },
         });
 
-        return this.validateResponse(response, 'setMission');
+        return this.validateResponse(response, 'getBankConfig');
+    }
+
+    /**
+     * Update configuration overrides for a bank.
+     *
+     * Can be disabled on the server by setting `HINDSIGHT_API_ENABLE_BANK_CONFIG_API=false`.
+     *
+     * @param bankId - The memory bank ID
+     * @param options - Fields to override
+     */
+    async updateBankConfig(
+        bankId: string,
+        options: {
+            reflectMission?: string;
+            retainMission?: string;
+            retainExtractionMode?: string;
+            retainCustomInstructions?: string;
+            retainChunkSize?: number;
+            enableObservations?: boolean;
+            observationsMission?: string;
+            /** How skeptical vs trusting (1=trusting, 5=skeptical). */
+            dispositionSkepticism?: number;
+            /** How literally to interpret information (1=flexible, 5=literal). */
+            dispositionLiteralism?: number;
+            /** How much to consider emotional context (1=detached, 5=empathetic). */
+            dispositionEmpathy?: number;
+        },
+    ): Promise<BankConfigResponse> {
+        const updates: Record<string, unknown> = {};
+        if (options.reflectMission !== undefined) updates.reflect_mission = options.reflectMission;
+        if (options.retainMission !== undefined) updates.retain_mission = options.retainMission;
+        if (options.retainExtractionMode !== undefined) updates.retain_extraction_mode = options.retainExtractionMode;
+        if (options.retainCustomInstructions !== undefined)
+            updates.retain_custom_instructions = options.retainCustomInstructions;
+        if (options.retainChunkSize !== undefined) updates.retain_chunk_size = options.retainChunkSize;
+        if (options.enableObservations !== undefined) updates.enable_observations = options.enableObservations;
+        if (options.observationsMission !== undefined) updates.observations_mission = options.observationsMission;
+        if (options.dispositionSkepticism !== undefined) updates.disposition_skepticism = options.dispositionSkepticism;
+        if (options.dispositionLiteralism !== undefined) updates.disposition_literalism = options.dispositionLiteralism;
+        if (options.dispositionEmpathy !== undefined) updates.disposition_empathy = options.dispositionEmpathy;
+
+        const response = await sdk.updateBankConfig({
+            client: this.client,
+            path: { bank_id: bankId },
+            body: { updates },
+        });
+
+        return this.validateResponse(response, 'updateBankConfig');
+    }
+
+    /**
+     * Reset all bank-level configuration overrides, reverting to server defaults.
+     *
+     * Can be disabled on the server by setting `HINDSIGHT_API_ENABLE_BANK_CONFIG_API=false`.
+     */
+    async resetBankConfig(bankId: string): Promise<BankConfigResponse> {
+        const response = await sdk.resetBankConfig({
+            client: this.client,
+            path: { bank_id: bankId },
+        });
+
+        return this.validateResponse(response, 'resetBankConfig');
     }
 
     /**
@@ -551,8 +735,10 @@ export type {
     RecallResult,
     ReflectRequest,
     ReflectResponse,
+    FileRetainResponse,
     ListMemoryUnitsResponse,
     BankProfileResponse,
+    BankConfigResponse,
     CreateBankRequest,
     Budget,
 };

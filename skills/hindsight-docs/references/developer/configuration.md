@@ -61,30 +61,62 @@ hindsight-admin run-db-migration --schema tenant_acme
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HINDSIGHT_API_VECTOR_EXTENSION` | Vector extension to use: `auto`, `pgvector`, or `vchord` | `auto` |
+| `HINDSIGHT_API_VECTOR_EXTENSION` | Vector index algorithm: `pgvector`, `vchord`, or `pgvectorscale` | `pgvector` |
 
-Hindsight supports two PostgreSQL vector extensions:
-- **pgvector**: Standard extension, works well for most embeddings (up to ~2000 dimensions)
-- **vchord**: Optimized for high-dimensional embeddings (3000+ dimensions), includes BM25 search
+Hindsight supports three PostgreSQL vector extensions:
 
-When set to `auto` (default), Hindsight automatically detects which extension is installed, preferring vchord if both are available.
+#### **pgvector** (HNSW - default)
+- In-memory index using Hierarchical Navigable Small World algorithm
+- Works well for most embeddings and dataset sizes
+- Fast for small-medium datasets (&lt;10M vectors)
+- Higher memory usage for large datasets
+- Most widely deployed and supported
+
+#### **pgvectorscale** (DiskANN - recommended for scale) ⭐
+- Disk-based index using StreamingDiskANN algorithm
+- **28x lower p95 latency** and **16x higher throughput** vs dedicated vector DBs
+- **60-75% cost reduction** at scale (SSDs cheaper than RAM)
+- Superior filtering performance with streaming retrieval model
+- Optimized for large datasets (10M+ vectors)
+- Supports both **pgvectorscale** (open source) and **pg_diskann** (Azure)
+- **Installation:**
+  - Open source/self-hosted: `CREATE EXTENSION vector; CREATE EXTENSION vectorscale CASCADE;`
+  - Azure PostgreSQL: `CREATE EXTENSION vector; CREATE EXTENSION pg_diskann CASCADE;`
+
+#### **vchord** (vchordrq)
+- Alternative high-performance vector index
+- Optimized for high-dimensional embeddings (3000+ dimensions)
+- Includes integrated BM25 search capabilities
+- Requires `vchord` extension
+
+**When to use pgvectorscale (DiskANN):**
+- Large datasets (10M+ vectors) ⭐
+- Complex filtering requirements
+- Cost-sensitive deployments
+- Production workloads requiring high throughput
+- When disk I/O is not a bottleneck
+
+**When to use pgvector (HNSW):**
+- Small-medium datasets (&lt;10M vectors)
+- Maximum query speed when all data fits in memory
+- Simple nearest-neighbor queries without filters
+- Standard PostgreSQL deployment preference
 
 **When to use vchord:**
-- Using high-dimensional embeddings (e.g., `text-embedding-3-large` with 3072 dimensions)
-- Need better performance with large embedding dimensions
-- Want to use vchord's BM25 search capabilities
-
-**When to use pgvector:**
-- Using standard embedding dimensions (384-1536)
-- Prefer the widely-adopted pgvector extension
-- Simpler deployment (pgvector is more commonly available)
+- High-dimensional embeddings (3000+ dimensions)
+- Want integrated BM25 search
+- Already using vchord for text search
 
 **Switching extensions:**
 
 If you need to switch from one extension to another:
-1. Set `HINDSIGHT_API_VECTOR_EXTENSION` to your desired extension (`pgvector` or `vchord`)
+1. Set `HINDSIGHT_API_VECTOR_EXTENSION` to your desired extension (`pgvector`, `vchord`, or `pgvectorscale`)
 2. If your database has existing data, you'll get an error with migration instructions
 3. For empty databases, indexes will be automatically recreated on startup
+
+**Learn more:**
+- [HNSW vs. DiskANN comparison](https://www.tigerdata.com/learn/hnsw-vs-diskann)
+- [pgvectorscale GitHub](https://github.com/timescale/pgvectorscale)
 
 ### Text Search Extension
 
@@ -136,6 +168,7 @@ To switch between backends:
 | `HINDSIGHT_API_LLM_MAX_BACKOFF` | Max retry backoff cap in seconds | `60.0` |
 | `HINDSIGHT_API_LLM_TIMEOUT` | LLM request timeout in seconds | `120` |
 | `HINDSIGHT_API_LLM_GROQ_SERVICE_TIER` | Groq service tier: `on_demand`, `flex`, `auto` | `auto` |
+| `HINDSIGHT_API_LLM_OPENAI_SERVICE_TIER` | OpenAI service tier: `flex` for 50% cost savings (OpenAI Flex Processing) | None (default) |
 
 **Provider Examples**
 
@@ -151,6 +184,8 @@ export HINDSIGHT_API_LLM_MODEL=openai/gpt-oss-20b
 export HINDSIGHT_API_LLM_PROVIDER=openai
 export HINDSIGHT_API_LLM_API_KEY=sk-xxxxxxxxxxxx
 export HINDSIGHT_API_LLM_MODEL=gpt-4o
+# Optional: Use Flex Processing for 50% cost savings (with variable latency)
+# export HINDSIGHT_API_LLM_OPENAI_SERVICE_TIER=flex
 
 # Gemini
 export HINDSIGHT_API_LLM_PROVIDER=gemini
@@ -197,60 +232,9 @@ export HINDSIGHT_API_LLM_MODEL=claude-sonnet-4-5-20250929
 # No API key needed - uses claude auth login credentials
 ```
 
-:::tip OpenAI Codex & Claude Code Setup
-For detailed setup instructions for **OpenAI Codex** (ChatGPT Plus/Pro) and **Claude Code** (Claude Pro/Max), see the [Models documentation](./models#openai-codex-setup-chatgpt-pluspro).
+:::tip OpenAI Codex, Claude Code & Vertex AI Setup
+For detailed setup instructions for **OpenAI Codex** (ChatGPT Plus/Pro), **Claude Code** (Claude Pro/Max), and **Vertex AI** (Google Cloud), see the [Models documentation](./models#openai-codex-setup-chatgpt-pluspro).
 :::
-
-#### Vertex AI Setup
-
-Google Cloud's Vertex AI provides access to Gemini models via the native Google GenAI SDK. Hindsight supports two authentication methods:
-
-**Prerequisites:**
-- GCP project with Vertex AI API enabled
-- IAM role `roles/aiplatform.user` for your credentials
-
-**Environment Variables:**
-
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID` | Your GCP project ID | Yes |
-| `HINDSIGHT_API_LLM_VERTEXAI_REGION` | GCP region (e.g., `us-central1`) | No (default: `us-central1`) |
-| `HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY` | Path to service account JSON key file | No (uses ADC if not set) |
-
-**Authentication Methods:**
-
-1. **Application Default Credentials (ADC)** - Recommended for development
-   ```bash
-   # Setup ADC
-   gcloud auth application-default login
-
-   # Configure Hindsight
-   export HINDSIGHT_API_LLM_PROVIDER=vertexai
-   export HINDSIGHT_API_LLM_MODEL=gemini-2.0-flash-001
-   export HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=your-project-id
-   ```
-
-2. **Service Account Key** - Recommended for production
-   ```bash
-   # Create service account and download key
-   gcloud iam service-accounts create hindsight-api
-   gcloud projects add-iam-policy-binding your-project-id \
-     --member="serviceAccount:hindsight-api@your-project-id.iam.gserviceaccount.com" \
-     --role="roles/aiplatform.user"
-   gcloud iam service-accounts keys create key.json \
-     --iam-account=hindsight-api@your-project-id.iam.gserviceaccount.com
-
-   # Configure Hindsight
-   export HINDSIGHT_API_LLM_PROVIDER=vertexai
-   export HINDSIGHT_API_LLM_MODEL=gemini-2.0-flash-001
-   export HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=your-project-id
-   export HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/path/to/key.json
-   ```
-
-**Notes:**
-- Model names can optionally include the `google/` prefix (e.g., `google/gemini-2.0-flash-001`) - it will be stripped automatically
-- The native SDK handles token refresh automatically
-- Uses service account credentials if provided, otherwise falls back to ADC
 
 ### Per-Operation LLM Configuration
 
@@ -424,7 +408,7 @@ Supported OpenAI embedding dimensions:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HINDSIGHT_API_RERANKER_PROVIDER` | Provider: `local`, `tei`, `cohere`, `flashrank`, `litellm`, `litellm-sdk`, or `rrf` | `local` |
+| `HINDSIGHT_API_RERANKER_PROVIDER` | Provider: `local`, `tei`, `cohere`, `zeroentropy`, `flashrank`, `litellm`, `litellm-sdk`, or `rrf` | `local` |
 | `HINDSIGHT_API_RERANKER_LOCAL_MODEL` | Model for local provider | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
 | `HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT` | Max concurrent local reranking (prevents CPU thrashing under load) | `4` |
 | `HINDSIGHT_API_RERANKER_LOCAL_TRUST_REMOTE_CODE` | Allow loading models with custom code (security risk, disabled by default) | `false` |
@@ -440,6 +424,8 @@ Supported OpenAI embedding dimensions:
 | `HINDSIGHT_API_RERANKER_LITELLM_SDK_API_KEY` | LiteLLM **SDK** API key for direct reranking (no proxy needed) | - |
 | `HINDSIGHT_API_RERANKER_LITELLM_SDK_MODEL` | LiteLLM SDK rerank model (e.g., `deepinfra/Qwen3-reranker-8B`) | `cohere/rerank-english-v3.0` |
 | `HINDSIGHT_API_RERANKER_LITELLM_SDK_API_BASE` | Custom API base URL for LiteLLM SDK (optional) | - |
+| `HINDSIGHT_API_RERANKER_ZEROENTROPY_API_KEY` | ZeroEntropy API key for reranking | - |
+| `HINDSIGHT_API_RERANKER_ZEROENTROPY_MODEL` | ZeroEntropy rerank model (`zerank-2`, `zerank-2-small`) | `zerank-2` |
 | `HINDSIGHT_API_RERANKER_FLASHRANK_MODEL` | FlashRank model for fast CPU-based reranking | `ms-marco-MiniLM-L-12-v2` |
 | `HINDSIGHT_API_RERANKER_FLASHRANK_CACHE_DIR` | Cache directory for FlashRank models | System default |
 
@@ -468,6 +454,11 @@ export HINDSIGHT_API_RERANKER_PROVIDER=cohere
 export HINDSIGHT_API_RERANKER_COHERE_API_KEY=your-azure-api-key
 export HINDSIGHT_API_RERANKER_COHERE_MODEL=rerank-english-v3.0
 export HINDSIGHT_API_RERANKER_COHERE_BASE_URL=https://your-azure-cohere-endpoint.com
+
+# ZeroEntropy - cloud-based reranking (state-of-the-art accuracy)
+export HINDSIGHT_API_RERANKER_PROVIDER=zeroentropy
+export HINDSIGHT_API_RERANKER_ZEROENTROPY_API_KEY=your-api-key
+export HINDSIGHT_API_RERANKER_ZEROENTROPY_MODEL=zerank-2  # or zerank-2-small
 
 # LiteLLM proxy - unified gateway for multiple reranking providers (requires running LiteLLM proxy server)
 export HINDSIGHT_API_RERANKER_PROVIDER=litellm
@@ -556,43 +547,186 @@ Controls the retain (memory ingestion) pipeline.
 | `HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS` | Max completion tokens for fact extraction LLM calls | `64000` |
 | `HINDSIGHT_API_RETAIN_CHUNK_SIZE` | Max characters per chunk for fact extraction. Larger chunks extract fewer LLM calls but may lose context. | `3000` |
 | `HINDSIGHT_API_RETAIN_EXTRACTION_MODE` | Fact extraction mode: `concise`, `verbose`, or `custom` | `concise` |
-| `HINDSIGHT_API_RETAIN_CUSTOM_INSTRUCTIONS` | Custom extraction guidelines (only used when mode is `custom`) | - |
+| `HINDSIGHT_API_RETAIN_MISSION` | What this bank should pay attention to during extraction. Steers the LLM without replacing the extraction rules — works alongside any extraction mode. | - |
+| `HINDSIGHT_API_RETAIN_CUSTOM_INSTRUCTIONS` | Full prompt override for fact extraction (only used when mode is `custom`). Replaces built-in extraction rules entirely. | - |
 | `HINDSIGHT_API_RETAIN_EXTRACT_CAUSAL_LINKS` | Extract causal relationships between facts | `true` |
+| `HINDSIGHT_API_RETAIN_BATCH_ENABLED` | Use LLM Batch API for fact extraction (50% cost savings, only with async operations) | `false` |
+| `HINDSIGHT_API_RETAIN_BATCH_POLL_INTERVAL_SECONDS` | Batch API polling interval in seconds | `60` |
 
-#### Extraction Modes
+> **Entity labels** (`entity_labels`) and **free-form entity extraction** (`entities_allow_free_form`) are configured per bank via the [bank config API](/developer/api/memory-banks#retain-configuration), not as global environment variables — each bank can have its own controlled vocabulary. See [Entity Labels](/developer/retain#entity-labels) for details.
 
-The extraction mode controls how aggressively facts are extracted from content:
+#### Customizing retain: when to use what
 
-- **`concise`** (default): Selective extraction that focuses on significant, long-term valuable facts. Filters out greetings, filler, and trivial information. Produces fewer but higher-quality facts with better performance.
+There are three levels of customization for the retain pipeline. Start with the simplest that covers your needs:
 
-- **`verbose`**: Detailed extraction that captures every piece of information with maximum verbosity. Produces more facts with extensive detail but slower performance and higher token usage.
+| Goal | Use |
+|------|-----|
+| Steer what topics to focus on or deprioritize | `HINDSIGHT_API_RETAIN_MISSION` |
+| Extract more detail per fact | `HINDSIGHT_API_RETAIN_EXTRACTION_MODE=verbose` |
+| Completely replace the extraction rules | `HINDSIGHT_API_RETAIN_EXTRACTION_MODE=custom` + `HINDSIGHT_API_RETAIN_CUSTOM_INSTRUCTIONS` |
 
-- **`custom`**: Inject your own extraction guidelines while keeping the structural parts of the prompt (output format, coreference resolution, temporal handling, etc.) intact. Useful for A/B testing different extraction strategies or domain-specific customization.
+**`HINDSIGHT_API_RETAIN_MISSION` — steer extraction without replacing it (recommended starting point)**
 
-**Example: Custom Extraction Mode**
+Tell the bank what to pay attention to during extraction, in plain language. The mission is injected into the extraction prompt alongside the built-in rules — it narrows focus without replacing the underlying logic. Works with any extraction mode (`concise`, `verbose`, `custom`).
 
 ```bash
-# Set mode to custom
-export HINDSIGHT_API_RETAIN_EXTRACTION_MODE=custom
+export HINDSIGHT_API_RETAIN_MISSION="Focus on technical decisions, architecture choices, and team member expertise. Deprioritize social or personal information."
+```
 
-# Define custom guidelines (multi-line is fine)
+**`HINDSIGHT_API_RETAIN_EXTRACTION_MODE=verbose` — more detail per fact**
+
+Use when you need richer facts with full context, relationships, and verbosity. Slower and uses more tokens than `concise`.
+
+**`HINDSIGHT_API_RETAIN_EXTRACTION_MODE=custom` + `HINDSIGHT_API_RETAIN_CUSTOM_INSTRUCTIONS` — full control**
+
+Replaces the built-in selectivity rules entirely. The structural parts of the prompt (output format, temporal handling, coreference resolution) remain intact — only the extraction guidelines are replaced.
+
+Use this when `retain_mission` isn't sufficient and you need strict inclusion/exclusion logic.
+
+```bash
+export HINDSIGHT_API_RETAIN_EXTRACTION_MODE=custom
 export HINDSIGHT_API_RETAIN_CUSTOM_INSTRUCTIONS="ONLY extract facts that are:
 ✅ Technical decisions and their rationale
 ✅ Architecture patterns and design choices
 ✅ Performance metrics and benchmarks
-✅ Code reviews and feedback
 
 DO NOT extract:
-❌ Generic greetings or pleasantries
+❌ Greetings or social conversation
 ❌ Process chatter (\"let me check\", \"one moment\")
-❌ Repeated information already captured
-
-CONSOLIDATE related technical discussions into ONE fact when possible.
-
-Ask yourself: 'Would this technical context be useful in 6 months?' If no, skip it."
+❌ Anything that would not be useful in 6 months"
 ```
 
-### Observations (Experimental)
+### File Processing
+
+Configuration for the file upload and conversion pipeline (used by `POST /v1/default/banks/{bank_id}/files/retain`).
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_ENABLE_FILE_UPLOAD_API` | Enable the file upload API endpoint | `true` |
+| `HINDSIGHT_API_FILE_PARSER` | File parser to use (`markitdown`, `iris`) | `markitdown` |
+| `HINDSIGHT_API_FILE_CONVERSION_MAX_BATCH_SIZE` | Max files per upload request | `10` |
+| `HINDSIGHT_API_FILE_CONVERSION_MAX_BATCH_SIZE_MB` | Max total upload size per request (MB) | `100` |
+| `HINDSIGHT_API_FILE_DELETE_AFTER_RETAIN` | Delete stored files after memory extraction completes | `true` |
+
+#### Parser: markitdown (default)
+
+Local file-to-markdown conversion using [Microsoft's markitdown](https://github.com/microsoft/markitdown). No external service required.
+
+**Supported formats:** PDF, DOCX, DOC, PPTX, PPT, XLSX, XLS, images (JPG, PNG — OCR), audio (MP3, WAV — transcription), HTML, TXT, MD, CSV.
+
+#### Parser: iris
+
+Cloud-based extraction via [Vectorize Iris](https://docs.vectorize.io/build-deploy/extract-information/understanding-iris/). Higher quality extraction for complex documents, powered by a remote AI service.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_FILE_PARSER_IRIS_TOKEN` | Vectorize API token | — |
+| `HINDSIGHT_API_FILE_PARSER_IRIS_ORG_ID` | Vectorize organization ID | — |
+
+**Supported formats:** PDF, DOCX, DOC, PPTX, PPT, XLSX, XLS, images (JPG, JPEG, PNG, GIF, BMP, TIFF, WEBP), HTML, TXT, MD, CSV.
+
+```bash
+# Use iris parser (requires Vectorize account)
+export HINDSIGHT_API_FILE_PARSER=iris
+export HINDSIGHT_API_FILE_PARSER_IRIS_TOKEN=your-vectorize-token
+export HINDSIGHT_API_FILE_PARSER_IRIS_ORG_ID=your-org-id
+```
+
+```bash
+# Increase batch limits for large file imports
+export HINDSIGHT_API_FILE_CONVERSION_MAX_BATCH_SIZE=20
+export HINDSIGHT_API_FILE_CONVERSION_MAX_BATCH_SIZE_MB=500
+
+# Keep files after processing (useful for debugging or re-processing)
+export HINDSIGHT_API_FILE_DELETE_AFTER_RETAIN=false
+```
+
+### File Storage
+
+Files uploaded via the file retain API are stored in an object storage backend before conversion. Choose the backend that fits your infrastructure.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_FILE_STORAGE_TYPE` | Storage backend: `native`, `s3`, `gcs`, or `azure` | `native` |
+
+#### Native (PostgreSQL)
+
+Files are stored as `BYTEA` in the `file_storage` table. No additional infrastructure required. Suitable for development and small deployments.
+
+```bash
+# Native storage is the default — no additional configuration needed
+export HINDSIGHT_API_FILE_STORAGE_TYPE=native
+```
+
+#### S3 / S3-Compatible
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_FILE_STORAGE_S3_BUCKET` | S3 bucket name | - |
+| `HINDSIGHT_API_FILE_STORAGE_S3_REGION` | AWS region | - |
+| `HINDSIGHT_API_FILE_STORAGE_S3_ENDPOINT` | Custom endpoint URL (for S3-compatible stores like MinIO, Cloudflare R2) | AWS default |
+| `HINDSIGHT_API_FILE_STORAGE_S3_ACCESS_KEY_ID` | AWS access key ID | - |
+| `HINDSIGHT_API_FILE_STORAGE_S3_SECRET_ACCESS_KEY` | AWS secret access key | - |
+
+```bash
+# AWS S3
+export HINDSIGHT_API_FILE_STORAGE_TYPE=s3
+export HINDSIGHT_API_FILE_STORAGE_S3_BUCKET=my-hindsight-files
+export HINDSIGHT_API_FILE_STORAGE_S3_REGION=us-east-1
+export HINDSIGHT_API_FILE_STORAGE_S3_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+export HINDSIGHT_API_FILE_STORAGE_S3_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+
+# S3-compatible (MinIO, Cloudflare R2, etc.)
+export HINDSIGHT_API_FILE_STORAGE_TYPE=s3
+export HINDSIGHT_API_FILE_STORAGE_S3_BUCKET=my-bucket
+export HINDSIGHT_API_FILE_STORAGE_S3_ENDPOINT=https://your-minio.example.com
+export HINDSIGHT_API_FILE_STORAGE_S3_ACCESS_KEY_ID=minioadmin
+export HINDSIGHT_API_FILE_STORAGE_S3_SECRET_ACCESS_KEY=minioadmin
+```
+
+#### Google Cloud Storage
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_FILE_STORAGE_GCS_BUCKET` | GCS bucket name | - |
+| `HINDSIGHT_API_FILE_STORAGE_GCS_SERVICE_ACCOUNT_KEY` | Path to service account JSON key file | ADC if not set |
+
+```bash
+export HINDSIGHT_API_FILE_STORAGE_TYPE=gcs
+export HINDSIGHT_API_FILE_STORAGE_GCS_BUCKET=my-hindsight-files
+# Optional: use service account key file (otherwise falls back to ADC)
+export HINDSIGHT_API_FILE_STORAGE_GCS_SERVICE_ACCOUNT_KEY=/path/to/key.json
+```
+
+#### Azure Blob Storage
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_FILE_STORAGE_AZURE_CONTAINER` | Azure container name | - |
+| `HINDSIGHT_API_FILE_STORAGE_AZURE_ACCOUNT_NAME` | Azure storage account name | - |
+| `HINDSIGHT_API_FILE_STORAGE_AZURE_ACCOUNT_KEY` | Azure storage account key | - |
+
+```bash
+export HINDSIGHT_API_FILE_STORAGE_TYPE=azure
+export HINDSIGHT_API_FILE_STORAGE_AZURE_CONTAINER=hindsight-files
+export HINDSIGHT_API_FILE_STORAGE_AZURE_ACCOUNT_NAME=mystorageaccount
+export HINDSIGHT_API_FILE_STORAGE_AZURE_ACCOUNT_KEY=base64encodedkey==
+```
+
+#### Storage Backend Comparison
+
+| Backend | Best For | Notes |
+|---------|----------|-------|
+| `native` | Development, small deployments | No extra infrastructure, stored in PostgreSQL |
+| `s3` | Production, AWS deployments | Works with any S3-compatible store |
+| `gcs` | Production, GCP deployments | Supports ADC for keyless auth |
+| `azure` | Production, Azure deployments | Uses account key auth |
+
+:::tip Production Recommendation
+For production deployments, use `s3`, `gcs`, or `azure` to avoid storing large binary files in your PostgreSQL database. Set `HINDSIGHT_API_FILE_DELETE_AFTER_RETAIN=true` (the default) to delete files after memory extraction, which minimizes storage costs.
+:::
+
+### Observations (Experimental) {#observations}
 
 Observations are consolidated knowledge synthesized from facts.
 
@@ -601,12 +735,65 @@ Observations are consolidated knowledge synthesized from facts.
 | `HINDSIGHT_API_ENABLE_OBSERVATIONS` | Enable observation consolidation | `true` |
 | `HINDSIGHT_API_CONSOLIDATION_BATCH_SIZE` | Memories to load per batch (internal optimization) | `50` |
 | `HINDSIGHT_API_CONSOLIDATION_MAX_TOKENS` | Max tokens for recall when finding related observations during consolidation | `1024` |
+| `HINDSIGHT_API_CONSOLIDATION_LLM_BATCH_SIZE` | Number of facts sent to the LLM in a single consolidation call. Higher values reduce LLM calls and improve throughput at the cost of larger prompts. Set to `1` to disable batching. | `8` |
+| `HINDSIGHT_API_OBSERVATIONS_MISSION` | What this bank should synthesise into durable observations. Replaces the built-in consolidation rules — leave unset to use the server default. | - |
+
+#### Customizing observations: when to use what
+
+| Goal | Use |
+|------|-----|
+| Default behavior: durable specific facts, no ephemeral state | Leave unset |
+| Change what observations *are* for this bank (different shape, different purpose) | `HINDSIGHT_API_OBSERVATIONS_MISSION` |
+
+**`HINDSIGHT_API_OBSERVATIONS_MISSION` — redefine what this bank synthesises**
+
+By default, observations are durable, specific facts synthesized from memories — the kind of knowledge that stays true over time (preferences, skills, relationships, recurring patterns). Ephemeral state is filtered out. Contradictions are tracked with temporal markers.
+
+Set `HINDSIGHT_API_OBSERVATIONS_MISSION` to replace this definition entirely. Write a plain-language description of what observations should be for your use case. The LLM will use this instead of the default rules when deciding what to create or update. Leave it unset to keep the server default.
+
+:::tip When to use observations_mission
+Use it when the default durable-knowledge behavior doesn't match your use case. Common scenarios:
+- You want **broader event summaries** rather than isolated facts
+- You want observations **grouped by time period** (weekly, monthly)
+- You want a **different granularity** (one observation per project rather than per fact)
+- You have a **domain-specific** notion of what's worth remembering
+:::
+
+**Example: Weekly event summaries**
+
+```bash
+export HINDSIGHT_API_OBSERVATIONS_MISSION="Observations are broad summaries of project events grouped by week. Each observation should capture what happened, what was decided, and what was blocked — not individual facts. Merge related events into cohesive weekly narratives."
+```
+
+**Example: Person-centric knowledge**
+
+```bash
+export HINDSIGHT_API_OBSERVATIONS_MISSION="Observations are durable facts about specific named people: their preferences, skills, relationships, and behavioral patterns. Only create observations for facts that are stable over time and tied to a named individual."
+```
+
+**Example: Support ticket patterns**
+
+```bash
+export HINDSIGHT_API_OBSERVATIONS_MISSION="Observations are recurring patterns in customer support interactions: common failure modes, frequently requested features, and pain points that appear across multiple tickets."
+```
 
 ### Reflect
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HINDSIGHT_API_REFLECT_MAX_ITERATIONS` | Max tool call iterations before forcing a response | `10` |
+| `HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS` | Max accumulated context tokens in the reflect loop before forcing final synthesis. Prevents `context_length_exceeded` errors on large banks. Lower this if your LLM has a context window smaller than 128K. | `100000` |
+| `HINDSIGHT_API_REFLECT_MISSION` | Global reflect mission (identity and reasoning framing). Overridden per bank via config API. | - |
+
+#### Disposition
+
+Disposition traits control how the bank reasons during reflect operations. Each trait is on a scale of 1–5. These are hierarchical — they can be overridden per bank via the [config API](./configuration.md#hierarchical-configuration).
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_DISPOSITION_SKEPTICISM` | How skeptical vs trusting (1=trusting, 5=skeptical) | `3` |
+| `HINDSIGHT_API_DISPOSITION_LITERALISM` | How literally to interpret information (1=flexible, 5=literal) | `3` |
+| `HINDSIGHT_API_DISPOSITION_EMPATHY` | How much to consider emotional context (1=detached, 5=empathetic) | `3` |
 
 ### MCP Server
 
@@ -615,9 +802,35 @@ Configuration for MCP server endpoints.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HINDSIGHT_API_MCP_ENABLED` | Enable MCP server at `/mcp/{bank_id}/` | `true` |
+| `HINDSIGHT_API_MCP_ENABLED_TOOLS` | Comma-separated allowlist of MCP tools to expose globally (empty = all tools) | - |
 | `HINDSIGHT_API_MCP_AUTH_TOKEN` | Bearer token for MCP authentication (optional) | - |
 | `HINDSIGHT_API_MCP_LOCAL_BANK_ID` | Memory bank ID for local MCP | `mcp` |
 | `HINDSIGHT_API_MCP_INSTRUCTIONS` | Additional instructions appended to retain/recall tool descriptions | - |
+
+**Tool Access Control:**
+
+`HINDSIGHT_API_MCP_ENABLED_TOOLS` restricts which MCP tools are registered at the server level. This is useful for read-only deployments or limiting surface area:
+
+```bash
+# Expose only recall (read-only deployment)
+export HINDSIGHT_API_MCP_ENABLED_TOOLS=recall
+
+# Expose recall and reflect only
+export HINDSIGHT_API_MCP_ENABLED_TOOLS=recall,reflect
+```
+
+Available tool names: `retain`, `recall`, `reflect`, `list_banks`, `create_bank`, `list_mental_models`, `get_mental_model`, `create_mental_model`, `update_mental_model`, `delete_mental_model`, `refresh_mental_model`, `list_directives`, `create_directive`, `delete_directive`, `list_memories`, `get_memory`, `delete_memory`, `list_documents`, `get_document`, `delete_document`, `list_operations`, `get_operation`, `cancel_operation`, `list_tags`, `get_bank`, `get_bank_stats`, `update_bank`, `delete_bank`, `clear_memories`.
+
+This can also be overridden per bank via the [config API](#hierarchical-configuration):
+
+```bash
+# Restrict a specific bank to read-only MCP access
+curl -X PATCH http://localhost:8888/v1/default/banks/my-bank/config \
+  -H "Content-Type: application/json" \
+  -d '{"updates": {"mcp_enabled_tools": ["recall"]}}'
+```
+
+When a bank-level `mcp_enabled_tools` is set, tools not in the list return a clear error when invoked (they still appear in the tools list for MCP protocol compatibility).
 
 **MCP Authentication:**
 
@@ -797,8 +1010,9 @@ This design prevents bugs where global defaults are used instead of bank overrid
 Configuration fields are categorized for security:
 
 1. **Configurable Fields** - Safe behavioral settings that can be customized per-bank:
-   - Retention: `retain_chunk_size`, `retain_extraction_mode`, `retain_custom_instructions`
-   - Consolidation: `enable_observations`
+   - Retention: `retain_chunk_size`, `retain_extraction_mode`, `retain_mission`, `retain_custom_instructions`
+   - Observations: `enable_observations`, `observations_mission`
+   - MCP access control: `mcp_enabled_tools`
 
 2. **Credential Fields** - NEVER exposed or configurable via API:
    - API keys: `*_api_key` (all LLM API keys)
@@ -813,13 +1027,7 @@ Configuration fields are categorized for security:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HINDSIGHT_API_ENABLE_BANK_CONFIG_API` | Enable per-bank config API | `false` |
-
-**Important:** The bank config API is **disabled by default** for security. Enable it explicitly:
-
-```bash
-export HINDSIGHT_API_ENABLE_BANK_CONFIG_API=true
-```
+| `HINDSIGHT_API_ENABLE_BANK_CONFIG_API` | Enable per-bank config API | `true` |
 
 #### API Endpoints
 
@@ -951,6 +1159,13 @@ HINDSIGHT_API_LLM_API_KEY=gsk_xxxxxxxxxxxx
 # Authentication (optional, recommended for production)
 # HINDSIGHT_API_TENANT_EXTENSION=hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension
 # HINDSIGHT_API_TENANT_API_KEY=your-secret-api-key
+
+# File storage (optional, defaults to PostgreSQL native storage)
+# HINDSIGHT_API_FILE_STORAGE_TYPE=s3
+# HINDSIGHT_API_FILE_STORAGE_S3_BUCKET=my-hindsight-files
+# HINDSIGHT_API_FILE_STORAGE_S3_REGION=us-east-1
+# HINDSIGHT_API_FILE_STORAGE_S3_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+# HINDSIGHT_API_FILE_STORAGE_S3_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 
 # Control Plane
 HINDSIGHT_CP_DATAPLANE_API_URL=http://localhost:8888

@@ -57,8 +57,15 @@ cd hindsight-control-plane && npm run dev
 
 ### Benchmarks
 ```bash
+# Accuracy benchmarks
 ./scripts/benchmarks/run-longmemeval.sh
 ./scripts/benchmarks/run-locomo.sh
+
+# Performance benchmarks
+./scripts/benchmarks/run-consolidation.sh
+./scripts/benchmarks/run-retain-perf.sh --document <path>  # Requires API server running
+
+# Results viewer
 ./scripts/benchmarks/start-visualizer.sh  # View results at localhost:8001
 ```
 
@@ -310,10 +317,10 @@ npm install
 Required env vars:
 - `HINDSIGHT_API_LLM_PROVIDER`: openai, anthropic, gemini, groq, ollama, lmstudio
 - `HINDSIGHT_API_LLM_API_KEY`: Your API key
-- `HINDSIGHT_API_LLM_MODEL`: Model name (e.g., o3-mini, claude-sonnet-4-20250514)
+- `HINDSIGHT_API_LLM_MODEL`: Model name (e.g., gpt-4o-mini, claude-sonnet-4-20250514)
 
 Optional (uses local models by default):
 - `HINDSIGHT_API_EMBEDDINGS_PROVIDER`: local (default) or tei
 - `HINDSIGHT_API_RERANKER_PROVIDER`: local (default) or tei
 - `HINDSIGHT_API_DATABASE_URL`: External PostgreSQL (uses embedded pg0 by default)
-- `HINDSIGHT_API_ENABLE_BANK_CONFIG_API`: Enable per-bank config API (default: false, disabled for security)
+- `HINDSIGHT_API_ENABLE_BANK_CONFIG_API`: Enable per-bank config API (default: true)

@@ -3,6 +3,42 @@
  * This should be used in client components, not the SDK directly
  */
 
+import { toast } from "sonner";
+
+export interface WebhookHttpConfig {
+  method: string;
+  timeout_seconds: number;
+  headers: Record<string, string>;
+  params: Record<string, string>;
+}
+
+export interface Webhook {
+  id: string;
+  bank_id: string | null;
+  url: string;
+  event_types: string[];
+  enabled: boolean;
+  http_config: WebhookHttpConfig;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface WebhookDelivery {
+  id: string;
+  webhook_id: string | null;
+  url: string;
+  event_type: string;
+  status: string;
+  attempts: number;
+  next_retry_at: string | null;
+  last_error: string | null;
+  last_response_status: number | null;
+  last_response_body: string | null;
+  last_attempt_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
 export interface MentalModel {
   id: string;
   bank_id: string;
@@ -19,20 +55,78 @@ export interface MentalModel {
 
 export class ControlPlaneClient {
   private async fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
-    const response = await fetch(path, {
-      ...options,
-      headers: {
-        "Content-Type": "application/json",
-        ...options?.headers,
-      },
-    });
+    try {
+      const response = await fetch(path, {
+        ...options,
+        headers: {
+          "Content-Type": "application/json",
+          ...options?.headers,
+        },
+      });
 
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`API Error: ${response.status} - ${error}`);
+      if (!response.ok) {
+        // Try to parse error response
+        let errorMessage = `HTTP ${response.status}`;
+        let errorDetails: string | undefined;
+
+        try {
+          const errorData = await response.json();
+          errorMessage = errorData.error || errorMessage;
+          errorDetails = errorData.details;
+        } catch {
+          // If JSON parse fails, try to get text
+          try {
+            const errorText = await response.text();
+            if (errorText) {
+              errorDetails = errorText;
+            }
+          } catch {
+            // Ignore text parse errors
+          }
+        }
+
+        // Show toast with different styles based on status code
+        const description = errorDetails || errorMessage;
+        const status = response.status;
+
+        if (status >= 400 && status < 500) {
+          // Client errors (4xx) - validation, bad request, etc. - show as warning
+          toast.warning("Client Error", {
+            description,
+            duration: 5000,
+          });
+        } else if (status >= 500) {
+          // Server errors (5xx) - show as error
+          toast.error("Server Error", {
+            description,
+            duration: 5000,
+          });
+        } else {
+          // Other HTTP errors - show as error
+          toast.error("API Error", {
+            description,
+            duration: 5000,
+          });
+        }
+
+        // Still throw error for callers that want to handle it
+        const error = new Error(errorMessage);
+        (error as any).status = response.status;
+        (error as any).details = errorDetails;
+        throw error;
+      }
+
+      return response.json();
+    } catch (error) {
+      // If it's not a response error (network error, etc.), show toast
+      if (!(error as any).status) {
+        toast.error("Network Error", {
+          description: error instanceof Error ? error.message : "Failed to connect to server",
+          duration: 5000,
+        });
+      }
+      throw error;
     }
-
-    return response.json();
   }
 
   /**
@@ -65,7 +159,7 @@ export class ControlPlaneClient {
     include?: {
       entities?: { max_tokens: number } | null;
       chunks?: { max_tokens: number } | null;
-      observations?: { max_results?: number } | null;
+      source_facts?: { max_tokens?: number } | null;
     };
     query_timestamp?: string;
     tags?: string[];
@@ -105,15 +199,17 @@ export class ControlPlaneClient {
       content: string;
       timestamp?: string;
       context?: string;
-      metadata?: Record<string, string>;
       document_id?: string;
+      metadata?: Record<string, string>;
       entities?: Array<{ text: string; type?: string }>;
+      tags?: string[];
+      observation_scopes?: "per_tag" | "combined" | "all_combinations" | string[][];
     }>;
     document_id?: string;
     async?: boolean;
   }) {
     const endpoint = params.async ? "/api/memories/retain_async" : "/api/memories/retain";
-    return this.fetchApi(endpoint, {
+    return this.fetchApi<{ message?: string }>(endpoint, {
       method: "POST",
       body: JSON.stringify(params),
     });
@@ -129,11 +225,21 @@ export class ControlPlaneClient {
   /**
    * Get graph data
    */
-  async getGraph(params: { bank_id: string; type?: string; limit?: number }) {
+  async getGraph(params: {
+    bank_id: string;
+    type?: string;
+    limit?: number;
+    q?: string;
+    tags?: string[];
+  }) {
     const queryParams = new URLSearchParams();
     queryParams.append("bank_id", params.bank_id);
     if (params.type) queryParams.append("type", params.type);
     if (params.limit) queryParams.append("limit", params.limit.toString());
+    if (params.q) queryParams.append("q", params.q);
+    if (params.tags && params.tags.length > 0) {
+      params.tags.forEach((tag) => queryParams.append("tags", tag));
+    }
     return this.fetchApi(`/api/graph?${queryParams}`);
   }
 
@@ -306,7 +412,41 @@ export class ControlPlaneClient {
       document_id: string | null;
       chunk_id: string | null;
       tags: string[];
+      observation_scopes: string | string[][] | null;
+      history?: {
+        previous_text: string;
+        previous_tags: string[];
+        previous_occurred_start: string | null;
+        previous_occurred_end: string | null;
+        previous_mentioned_at: string | null;
+        changed_at: string;
+        new_source_memory_ids: string[];
+      }[];
     }>(`/api/memories/${memoryId}?bank_id=${bankId}`);
+  }
+
+  /**
+   * Get the history of an observation with resolved source facts
+   */
+  async getObservationHistory(memoryId: string, bankId: string) {
+    return this.fetchApi<
+      {
+        previous_text: string;
+        previous_tags: string[];
+        previous_occurred_start: string | null;
+        previous_occurred_end: string | null;
+        previous_mentioned_at: string | null;
+        changed_at: string;
+        new_source_memory_ids: string[];
+        source_facts: {
+          id: string;
+          text: string | null;
+          type: string | null;
+          context: string | null;
+          is_new: boolean;
+        }[];
+      }[]
+    >(`/api/memories/${memoryId}/history?bank_id=${bankId}`);
   }
 
   /**
@@ -674,6 +814,18 @@ export class ControlPlaneClient {
   }
 
   /**
+   * Get the refresh history of a mental model
+   */
+  async getMentalModelHistory(bankId: string, mentalModelId: string) {
+    return this.fetchApi<
+      {
+        previous_content: string | null;
+        changed_at: string;
+      }[]
+    >(`/api/banks/${bankId}/mental-models/${mentalModelId}/history`);
+  }
+
+  /**
    * Get API version and feature flags
    * Use this to check which capabilities are available in the dataplane
    */
@@ -685,8 +837,67 @@ export class ControlPlaneClient {
         mcp: boolean;
         worker: boolean;
         bank_config_api: boolean;
+        file_upload_api: boolean;
       };
     }>("/api/version");
+  }
+
+  /**
+   * Upload files for retain (uses file conversion API)
+   * Requires file_upload_api feature flag to be enabled
+   * Converter is configured server-side via HINDSIGHT_API_FILE_CONVERTER
+   */
+  async uploadFiles(params: {
+    bank_id: string;
+    files: File[];
+    document_tags?: string[];
+    async?: boolean;
+    files_metadata?: Array<{
+      document_id?: string;
+      context?: string;
+      metadata?: Record<string, any>;
+      tags?: string[];
+      timestamp?: string;
+    }>;
+  }) {
+    const formData = new FormData();
+
+    // Add files
+    params.files.forEach((file) => {
+      formData.append("files", file);
+    });
+
+    // Add request JSON (including bank_id)
+    const requestData: any = {
+      bank_id: params.bank_id,
+      async: params.async ?? true,
+    };
+    if (params.document_tags) requestData.document_tags = params.document_tags;
+    if (params.files_metadata) requestData.files_metadata = params.files_metadata;
+
+    formData.append("request", JSON.stringify(requestData));
+
+    // Use fetch directly for multipart/form-data
+    const response = await fetch(`/api/files/retain`, {
+      method: "POST",
+      body: formData,
+      // Don't set Content-Type - browser will set it with boundary
+    });
+
+    if (!response.ok) {
+      let errorMessage = `HTTP ${response.status}`;
+      try {
+        const errorData = await response.json();
+        errorMessage = errorData.error || errorMessage;
+      } catch {
+        // Ignore parse errors
+      }
+      const error = new Error(errorMessage);
+      (error as any).status = response.status;
+      throw error;
+    }
+
+    return response.json();
   }
 
   /**
@@ -725,6 +936,79 @@ export class ControlPlaneClient {
     }>(`/api/banks/${bankId}/config`, {
       method: "DELETE",
     });
+  }
+
+  /**
+   * List webhooks for a bank
+   */
+  async listWebhooks(bankId: string): Promise<{ items: Webhook[] }> {
+    return this.fetchApi<{ items: Webhook[] }>(`/api/banks/${bankId}/webhooks`);
+  }
+
+  /**
+   * Create a webhook
+   */
+  async createWebhook(
+    bankId: string,
+    params: {
+      url: string;
+      secret?: string;
+      event_types?: string[];
+      enabled?: boolean;
+      http_config?: WebhookHttpConfig;
+    }
+  ): Promise<Webhook> {
+    return this.fetchApi<Webhook>(`/api/banks/${bankId}/webhooks`, {
+      method: "POST",
+      body: JSON.stringify(params),
+    });
+  }
+
+  /**
+   * Update a webhook (PATCH — only provided fields are changed)
+   */
+  async updateWebhook(
+    bankId: string,
+    webhookId: string,
+    params: {
+      url?: string;
+      secret?: string | null;
+      event_types?: string[];
+      enabled?: boolean;
+      http_config?: WebhookHttpConfig;
+    }
+  ): Promise<Webhook> {
+    return this.fetchApi<Webhook>(`/api/banks/${bankId}/webhooks/${webhookId}`, {
+      method: "PATCH",
+      body: JSON.stringify(params),
+    });
+  }
+
+  /**
+   * Delete a webhook
+   */
+  async deleteWebhook(bankId: string, webhookId: string): Promise<{ success: boolean }> {
+    return this.fetchApi<{ success: boolean }>(`/api/banks/${bankId}/webhooks/${webhookId}`, {
+      method: "DELETE",
+    });
+  }
+
+  /**
+   * List webhook deliveries
+   */
+  async listWebhookDeliveries(
+    bankId: string,
+    webhookId: string,
+    limit?: number,
+    cursor?: string
+  ): Promise<{ items: WebhookDelivery[]; next_cursor: string | null }> {
+    const params = new URLSearchParams();
+    if (limit) params.append("limit", limit.toString());
+    if (cursor) params.append("cursor", cursor);
+    const query = params.toString();
+    return this.fetchApi<{ items: WebhookDelivery[]; next_cursor: string | null }>(
+      `/api/banks/${bankId}/webhooks/${webhookId}/deliveries${query ? `?${query}` : ""}`
+    );
   }
 }
 
